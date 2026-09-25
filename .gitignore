@@ -1,0 +1,28 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller intermediate build cache (build directory)
+build/
+*.spec.bak
+
+# Local logs and runtime data
+*.log
+log.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE & Editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+Desktop.ini
