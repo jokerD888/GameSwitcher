@@ -21,6 +21,16 @@ When you're ready to game, your PC might have dozens of apps open — browser ta
 
 ---
 
+## 📥 Download
+
+👉 **[Go to GitHub Releases to download the latest GameSwitcher.exe](https://github.com/jokerD888/GameSwitcher/releases)**
+
+- **Single Portable Executable**: Just download `GameSwitcher.exe` and double-click to run. No installer, no clutter.
+- **Zero Dependencies**: Bundles everything required internally; no Python or runtime installation needed.
+- **Clean Persistence**: Snapshots and configurations live safely in `%APPDATA%\GameSwitcher\`.
+
+---
+
 ## 🚀 Quick Start (Just 3 Steps)
 
 1. **Place & Run**: Put `GameSwitcher.exe` in a permanent folder and launch it. It resides in your bottom-right system tray area.

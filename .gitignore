@@ -3,8 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# PyInstaller intermediate build cache (build directory)
+# PyInstaller build and distribution
 build/
+dist/
 *.spec.bak
 
 # Local logs and runtime data
@@ -26,3 +27,8 @@ ENV/
 # OS files
 Thumbs.db
 Desktop.ini
+
+# Promotional materials & media (keep local, not tracked in repo)
+*.mp4
+PROMOTION.md
+
