@@ -1,90 +1,62 @@
-# GameSwitcher — Blazing Fast One-Click Gaming Mode Switcher
+# GameSwitcher — Switch between gaming and desktop applications
 
-> Close all non-baseline background apps in one second before gaming; restore them all with one click after. Pure silence, zero interruptions, ultra-lightweight.
+A Windows tray utility that records application launch information, requests normal closure of visible non-baseline applications, and attempts to reopen them later.
 
-When you're ready to game, your PC might have dozens of apps open — browser tabs, IDEs, chat tools, music players, and office suites. They eat up precious CPU, GPU memory, and RAM bandwidth, and cause frame drops from background notifications. Reopening them one by one after gaming is tedious.  
-**GameSwitcher** solves this: two clicks in your system tray to seamlessly toggle between work and play.
+## Reliability behavior
 
----
+- Recovery records are atomically committed before any close request.
+- Applications are given 5 seconds by default to close normally. Save prompts and cancellation are respected by leaving surviving applications alone. No forced termination or process-tree termination is used.
+- Targets are limited to accessible visible windows in the current user/session. System applications, this process and its ancestors are protected. Executable matching uses full paths.
+- Separate window-owning processes keep separate launch arguments and working directories.
+- A relaunch is confirmed by a new visible window remaining present briefly. Unconfirmed records are retained. Clicking Restore again does not silently repeat an uncertain launch; explicit retry is available after checking the application.
+- Exit cancels subsequent work and waits for active work to finish.
+- The exclusion menu provides Refresh and lists every available path. New exclusions are path-specific; legacy filename rules remain supported.
+- Invalid or unreadable configuration stops the operation instead of removing protection rules.
+- Logs rotate at approximately 1 MB with three backups.
 
-## 🌟 Key Features
+## Quick start
 
-- ⚡ **Ultra-Fast Parallel Termination**: Concurrent broadcast of `WM_CLOSE` graceful save signal + 1.5s smooth exit grace period + single-pass batch `TASKKILL` cleanup. **Completes in ~1 second with zero prompt interruptions.**
-- 🎯 **Clear Red/Blue Visual Status**:
-  - 🔵 **Tech Blue Badge**: Ready / Normal mode.
-  - 🔴 **Gaming Neon Red Badge**: In Gaming Mode (tray tooltip displays the number of suspended applications in real-time).
-- 🔕 **Rule of Silence**: Silent on success. Necessary balloon notifications automatically dismiss after exactly 3 seconds to keep your screen distraction-free.
-- 🛡️ **Zero-Typing Exclude Menu**: The tray menu dynamically lists currently running visible apps; simply click any app to add or remove it from the exclusion list without typing filenames.
-- 🔄 **Crash-Resilient Snapshot**: Pending application snapshots are persisted atomically on disk. Even if your PC loses power or crashes during a game, your suspended apps remain safe and ready to restore.
-- 🗑️ **Flexible Discard Option**: Finished gaming late at night and just want to shut down? Use **「Discard Restore (Clear Snapshot)」** to clear the snapshot and return to ready state without relaunching old applications.
-- 🪶 **Ultra Featherweight**: Standalone single-file executable is only **~7.58 MB**; idle memory footprint is just **~6.7 MB** with 0% CPU usage.
+1. Start the utility and capture a baseline in a clean desktop environment. Game mode requires an explicitly captured baseline.
+2. Refresh the exclusion list and select applications to keep running.
+3. Enter game mode. Handle any save prompt shown by the target application. Applications that remain open are not forcibly terminated.
+4. Restore after gaming. Check uncertain applications manually before using the explicit retry action.
+5. Discard recovery records / return to ready when recovery is no longer needed.
 
----
+Blue means ready. Red means game mode or pending work; the tooltip distinguishes partial or interrupted operations. Run at Startup uses the current executable path, so reconfigure it after moving the application.
 
-## 📥 Download
+## Recovery limits
 
-👉 **[Go to GitHub Releases to download the latest GameSwitcher.exe](https://github.com/jokerD888/GameSwitcher/releases)**
+The snapshot stores launch information, not process memory or document content. Unsaved work, every browser tab, and multiple workspaces within a single process cannot be guaranteed; session recovery depends on the target application's settings.
 
-- **Single Portable Executable**: Just download `GameSwitcher.exe` and double-click to run. No installer, no clutter.
-- **Zero Dependencies**: Bundles everything required internally; no Python or runtime installation needed.
-- **Clean Persistence**: Snapshots and configurations live safely in `%APPDATA%\GameSwitcher\`.
+Invisible applications, slow startup, additional application prompts, internal helper arguments and unavailable working directories can prevent confirmation. Records remain available. Closing a window normally can also leave the application's own background processes running.
 
----
+Legacy list snapshots can be read. New writes use version 2; do not let an old executable write to upgraded snapshots. Data lives in %APPDATA%\GameSwitcher. Exit safely before manually editing configuration.
 
-## 🚀 Quick Start (Just 3 Steps)
+~~~json
+{
+  "exclude_list": ["C:/Apps/Voice/voice.exe"],
+  "grace_timeout_sec": 5,
+  "restore_timeout_sec": 8
+}
+~~~
 
-1. **Place & Run**: Put `GameSwitcher.exe` in a permanent folder and launch it. It resides in your bottom-right system tray area.
-2. **Capture Baseline**: On a freshly booted, clean desktop (with only your essential startup software running), right-click the tray icon → **「捕获基线」(Capture Baseline)**. You only need to do this once.
-3. **Auto-Start**: Right-click the tray icon → check **「开机自启」(Run at Startup)** so it's always ready.
+Close timeout: 0.1–60 seconds. Restore confirmation timeout: 1–30 seconds.
 
----
+## Development and build
 
-## 🎮 Daily Workflow
+Windows / Python 3.13 with the pinned dependencies:
 
-* **Before Gaming**: Right-click tray icon → **「🎮 进入游戏模式（关闭并保存快照）」(Enter Gaming Mode)**  
-  *GameSwitcher snapshots your open applications, rapidly closes them, and turns the tray icon bright red.*
-* **While Gaming**: Enjoy full performance without background clutter or popups.
-* **After Gaming**:
-  * **Resume Work**: Right-click tray icon → **「✨ 恢复应用」(Restore Apps)** to relaunch everything.
-  * **Go to Sleep**: Right-click tray icon → **「🗑️ 放弃恢复（清空挂起快照）」(Discard Restore)** to clear the snapshot and reset to blue ready state.
-
----
-
-## 🛡️ Exclude List (Never Close)
-
-To keep voice chat (Discord, YY), game launchers, or OBS streaming tools open in Game Mode:
-* Right-click tray icon → **「排除名单（永不关闭）」(Exclude List)**:
-  * The lower section shows currently running apps. **Click any app to immediately exclude it.**
-  * Excluded apps are marked with `✓` at the top; click to un-exclude.
-  * Click **「📁 打开配置与日志目录」(Open Config Folder)** to directly view or edit `config.json`.
-
----
-
-## 💡 FAQ
-
-**Q: Are there annoying popups when entering Game Mode?**  
-A: **None.** Following the Rule of Silence, both closing and restoring operate completely silently. The tool gracefully asks apps to save and exit, then batch-kills remaining targets after 1.5 seconds. A warning dialog is only shown if a privileged process fails to terminate.
-
-**Q: Will my browser tabs be restored?**  
-A: Yes. Modern browsers (Chrome, Edge, Brave) and editors (VS Code, Sublime) have native crash/restart session recovery that reopens all previous tabs automatically.
-
-**Q: What is never closed?**  
-A: Your baseline apps, excluded apps, and Windows core system processes (Explorer, input methods, dwm, GPU driver overlays, Xbox GameBar, etc.).
-
-**Q: How do I completely uninstall it?**  
-A: Uncheck "Run at Startup" in tray → click "Exit" → delete the exe and `%APPDATA%\GameSwitcher\`. Clean and zero registry residue.
-
----
-
-## 🛠️ Build from Source
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run from source
+~~~powershell
+python -m pip install -r requirements.txt
 python main.py
+python -m unittest discover -s tests -v
+python main.py --self-test
 
-# Build portable executable
+python -m pip install -r requirements-build.txt
 python -m PyInstaller GameSwitcher.spec --noconfirm
-```
+.\dist\GameSwitcher.exe --self-test packaged-smoke.json
+~~~
+
+Regression tests mock all application operations. The native self-test uses temporary data and an invisible tray; it never closes applications or changes the registry. Windows CI runs regressions, the source self-test, a build and the packaged self-test.
+
+[Historical releases](https://github.com/jokerD888/GameSwitcher/releases) may predate these changes; a local fix does not publish a new release. See the Chinese review and fix notes in the review directory.

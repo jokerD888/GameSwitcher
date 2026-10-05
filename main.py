@@ -1,453 +1,564 @@
-"""GameSwitcher - tray application.
-
-Close all non-baseline apps with one click before gaming, restore them after.
-Run after boot, "捕获基线" once, then use 托盘菜单 to switch modes.
-"""
-import ctypes
+"""GameSwitcher tray UI. Disk/process work stays off the native message thread."""
 import functools
 import logging
+from logging.handlers import RotatingFileHandler
+import msvcrt
 import os
+import queue
 import sys
 import threading
 import winreg
+import ctypes
 
 import pystray
 from PIL import Image, ImageDraw
+import win32api
+import win32con
+import win32gui
+import win32process
 
 import core
 import storage
 
 log = logging.getLogger("gameswitcher")
+MB_ICONINFO, MB_ICONWARN = 0x40, 0x30
+MB_TOPMOST, MB_SETFOREGROUND, MB_YESNO = 0x40000, 0x10000, 0x04
+IDYES, IDCANCEL = 6, 2
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+VAL_NAME = "GameSwitcher"
+icon = None
+_action_lock = threading.Lock()
+_workers_lock = threading.Lock()
+_workers = set()
+_shutdown = threading.Event()
+_busy = False
+_instance_file = None
+_compat_mutex = None
+_notify_timer = None
+_notify_generation = 0
+_cache = {"state": {"mode": "ready", "apps": []}, "config": {"exclude_list": []},
+          "running": [], "autostart": False}
 
 
-def setup_logging() -> None:
+class TrayIcon(pystray.Icon):
+    """Marshal native menu/icon changes onto pystray's Windows message thread.
+
+    pystray's Win32 backend is pinned and covered by the read-only smoke check.
+    """
+    DISPATCH_MESSAGE = win32con.WM_APP + 27
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dispatch_queue = queue.Queue()
+        self._menu_open = False
+        self._message_handlers[self.DISPATCH_MESSAGE] = self._on_dispatch
+
+    def dispatch(self, callback):
+        self._dispatch_queue.put(callback)
+        if self._hwnd:
+            win32api.PostMessage(self._hwnd, self.DISPATCH_MESSAGE, 0, 0)
+
+    def _on_dispatch(self, *_):
+        if self._menu_open:
+            return 0  # TrackPopupMenu pumps messages; never destroy its active HMENU.
+        while True:
+            try:
+                callback = self._dispatch_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                log.exception("UI callback failed")
+        return 0
+
+    def _on_notify(self, wparam, lparam):
+        if lparam != win32con.WM_RBUTTONUP:
+            return super()._on_notify(wparam, lparam)
+        self._menu_open = True
+        try:
+            return super()._on_notify(wparam, lparam)
+        finally:
+            self._menu_open = False
+            self._on_dispatch()
+
+    def _mark_ready(self):
+        super()._mark_ready()
+        self._on_dispatch()
+
+
+def setup_logging():
     try:
-        logging.basicConfig(
-            filename=storage.log_path(), encoding="utf-8",
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        handler = RotatingFileHandler(storage.log_path(), maxBytes=1024 * 1024, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(handler)
+        logging.getLogger().setLevel(logging.INFO)
     except OSError:
         logging.basicConfig(level=logging.INFO)
 
 
-MB_ICONINFO = 0x40
-MB_ICONWARN = 0x30
-MB_TOPMOST = 0x40000
-MB_SETFOREGROUND = 0x10000
-MB_OKCANCEL = 0x01
-MB_YESNO = 0x04
-MB_YESNOCANCEL = 0x03
-IDOK = 1
-IDCANCEL = 2
-IDYES = 6
-IDNO = 7
+def _msg_box(text, title="GameSwitcher", flags=MB_ICONWARN):
+    if _shutdown.is_set():
+        return IDCANCEL
+    return ctypes.windll.user32.MessageBoxW(0, text, title, flags | MB_TOPMOST | MB_SETFOREGROUND)
 
-icon = None  # pystray.Icon, set in main()
 
-# pystray runs menu actions inline on its message-loop thread; native dialogs
-# shown from that stack freeze. Every action runs on its own thread instead.
-# This lock also keeps game mode / restore from overlapping.
-_action_lock = threading.Lock()
+def _data_location():
+    return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), storage.APP_DIR_NAME)
+
+
+def notify(msg, title="GameSwitcher", warn=False, timeout=3):
+    if warn:
+        _msg_box(msg, title, MB_ICONWARN)
+        return
+    if not icon or _shutdown.is_set():
+        return
+
+    def show():
+        global _notify_timer, _notify_generation
+        _notify_generation += 1
+        generation = _notify_generation
+        if _notify_timer:
+            _notify_timer.cancel()
+        icon.notify(msg, title)
+        if timeout > 0:
+            def dismiss():
+                def remove():
+                    if generation == _notify_generation and not _shutdown.is_set():
+                        icon.remove_notification()
+                if not _shutdown.is_set() and icon:
+                    icon.dispatch(remove)
+            _notify_timer = threading.Timer(timeout, dismiss)
+            _notify_timer.daemon = True
+            _notify_timer.start()
+    icon.dispatch(show)
+
+
+def _refresh_cache():
+    global _cache
+    # Keep the recovery menu available even if an unrelated process scan fails.
+    _cache = dict(_cache, state=storage.load_state())
+    cfg = storage.load_config()
+    _cache = dict(_cache, config=cfg, autostart=autostart_enabled())
+    _cache = dict(_cache, running=core.visible_apps())
+
+
+def _request_update():
+    if icon and not _shutdown.is_set():
+        icon.dispatch(update_tray_state)
 
 
 def threaded(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        def run():
-            try:
-                log.info("action start: %s", fn.__name__)
-                fn(*args, **kwargs)
-                log.info("action done: %s", fn.__name__)
-            except Exception:
-                log.exception("action failed: %s", fn.__name__)
+        global _busy
+        with _workers_lock:
+            if _shutdown.is_set():
+                return
+            if not _action_lock.acquire(blocking=False):
+                notify("已有操作正在进行中。")
+                return
+            _busy = True
+
+            def run():
+                global _busy
                 try:
-                    _msg_box(f"操作「{fn.__name__}」出错，请把日志发给开发者：\n"
-                             f"{storage.log_path()}", "GameSwitcher",
-                             MB_ICONWARN)
-                except Exception:
-                    pass
-        threading.Thread(target=run, daemon=True).start()
+                    log.info("action start: %s", fn.__name__)
+                    if not _shutdown.is_set():
+                        fn(*args, **kwargs)
+                    log.info("action done: %s", fn.__name__)
+                except Exception as exc:
+                    log.exception("action failed: %s", fn.__name__)
+                    _msg_box(f"操作未完成：{exc}\n\n原恢复记录会保留。配置与日志目录：\n{_data_location()}")
+                finally:
+                    try:
+                        _refresh_cache()
+                    except Exception:
+                        log.exception("cache refresh failed; keeping previous display")
+                    with _workers_lock:
+                        _busy = False
+                        _action_lock.release()
+                        _workers.discard(threading.current_thread())
+                    _request_update()
+            worker = threading.Thread(target=run, name=f"action-{fn.__name__}", daemon=False)
+            _workers.add(worker)
+            try:
+                worker.start()
+            except Exception:
+                _workers.discard(worker)
+                _busy = False
+                _action_lock.release()
+                raise
+        _request_update()
+        return worker
     return wrapper
 
 
-def acquire_lock() -> bool:
-    return _action_lock.acquire(blocking=False)
+def already_running(mutex_name=r"Local\GameSwitcher_SingleInstance"):
+    """A per-profile file lock also excludes instances in other login sessions."""
+    global _instance_file, _compat_mutex
+    stream = open(os.path.join(storage.data_dir(), ".instance.lock"), "a+b")
+    if os.fstat(stream.fileno()).st_size == 0:
+        stream.write(b"\0")
+        stream.flush()
+    stream.seek(0)
+    try:
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        stream.close()
+        return True
+    _instance_file = stream
+    # Keep the old session mutex as well, so an already running v1 cannot race
+    # the migrated snapshot writer in the same desktop session.
+    kernel = ctypes.windll.kernel32
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    _compat_mutex = kernel.CreateMutexW(None, False, mutex_name)
+    error = kernel.GetLastError()
+    if not _compat_mutex:
+        _release_instance()
+        raise OSError("无法创建单实例互斥")
+    if error == 183:
+        _release_instance()
+        return True
+    return False
 
 
-def release_lock() -> None:
-    _action_lock.release()
-
-
-_mutex_handle = None
-MUTEX_NAME = "Local\\GameSwitcher_SingleInstance"
-ERROR_ALREADY_EXISTS = 183
-
-
-def already_running() -> bool:
-    """True if another GameSwitcher instance holds the startup mutex."""
-    global _mutex_handle
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    _mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    return kernel32.GetLastError() == ERROR_ALREADY_EXISTS
-
-
-_notify_timer = None
-_notify_timer_lock = threading.Lock()
-
-
-def notify(msg: str, title: str = "GameSwitcher", warn: bool = False, timeout: float = 3.0) -> None:
-    """Display toast notification (auto-dismiss after timeout seconds) or warn msgbox."""
-    global _notify_timer
-    if icon:
-        icon.notify(msg, title)
-        if timeout > 0:
-            with _notify_timer_lock:
-                if _notify_timer is not None:
-                    _notify_timer.cancel()
-
-                def _dismiss():
-                    try:
-                        if icon:
-                            icon.remove_notification()
-                    except Exception:
-                        pass
-
-                _notify_timer = threading.Timer(timeout, _dismiss)
-                _notify_timer.daemon = True
-                _notify_timer.start()
-    if warn:
-        ctypes.windll.user32.MessageBoxW(0, msg, title, MB_ICONWARN | MB_TOPMOST | MB_SETFOREGROUND)
-
-
-
-def _msg_box(text: str, title: str, flags: int) -> int:
-    return ctypes.windll.user32.MessageBoxW(0, text, title, flags | MB_TOPMOST | MB_SETFOREGROUND)
+def _release_instance():
+    global _instance_file, _compat_mutex
+    if _compat_mutex:
+        ctypes.windll.kernel32.CloseHandle(_compat_mutex)
+        _compat_mutex = None
+    if _instance_file:
+        try:
+            _instance_file.seek(0)
+            msvcrt.locking(_instance_file.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            _instance_file.close()
+            _instance_file = None
 
 
 @threaded
-def do_capture(icon_=None, item=None):
-    if not acquire_lock():
-        notify("已有操作正在进行中，请等它完成。", warn=True)
+def do_capture(*_):
+    if storage.baseline_exists() and _msg_box("重新捕获将覆盖基线。请先关闭临时软件。\n确定继续？",
+                                             flags=MB_YESNO | MB_ICONWARN) != IDYES:
         return
-    try:
-        old_baseline = storage.load_baseline()
-        if old_baseline:
-            r = _msg_box(
-                f"当前已存在基线（共 {len(old_baseline)} 个应用）。\n\n"
-                "⚠️ 重新捕获将覆盖现有基线配置。\n"
-                "请确保当前处于刚开机的干净环境（无额外临时打开的软件）。\n\n"
-                "确定要重新捕获吗？",
-                "GameSwitcher - 确认捕获基线",
-                MB_YESNO | MB_ICONWARN
-            )
-            if r != IDYES:
-                return
-        apps = core.visible_apps()
-        storage.save_baseline(apps)
-        if apps:
-            names = "\n- " + "\n- ".join(a["name"] for a in apps)
-            msg = f"已成功捕获基线，共 {len(apps)} 个应用：{names}"
-        else:
-            msg = "已成功捕获基线（当前为 0 个应用，进入游戏模式将关闭所有非排除应用）。"
-        _msg_box(msg, "GameSwitcher", MB_ICONINFO)
-    finally:
-        release_lock()
-
-
-@threaded
-def do_enter_game_mode(icon_=None, item=None):
-    if not acquire_lock():
-        notify("已有操作正在进行中，请等它完成。", warn=True)
+    apps = core.visible_apps()
+    if _shutdown.is_set():
         return
-    try:
-        _enter_game_mode()
-    finally:
-        release_lock()
+    storage.save_baseline(apps)
+    _msg_box(f"已捕获基线：{len({core.path_key(a['exe']) for a in apps})} 个程序。\n基线程序会保留运行。",
+             flags=MB_ICONINFO)
 
 
 def _enter_game_mode():
     cfg = storage.load_config()
-    baseline_exes = {os.path.normcase(a["exe"]) for a in storage.load_baseline()}
-    exclude = {os.path.normcase(e) for e in cfg["exclude_list"]}
-
-    def to_close(app):
-        key = os.path.normcase(app["exe"])
-        name_key = os.path.basename(key)
-        return (key not in baseline_exes
-                and name_key not in exclude
-                and key not in exclude)
-
-    targets = [a for a in core.visible_apps() if to_close(a)]
+    baseline = storage.load_baseline()
+    storage.load_state()  # fail before any window messages if the old journal is corrupt
+    if not storage.baseline_exists():
+        _msg_box("请先在干净环境中捕获基线，再进入游戏模式。", flags=MB_ICONINFO)
+        return
+    baseline_exes = {core.path_key(a["exe"]) for a in baseline}
+    targets = [dict(a, status="prepared") for a in core.visible_apps()
+               if core.path_key(a["exe"]) not in baseline_exes
+               and not core.is_excluded(a, cfg["exclude_list"])]
+    if _shutdown.is_set():
+        return
+    # Durable intent precedes the very first WM_CLOSE. A write failure aborts.
+    journal = storage.merge_pending_restore(targets, "entering")
     if not targets:
-        notify("当前没有需要关闭的非基线应用，已在游戏模式。")
-        update_tray_state()
+        storage.save_pending_restore(journal, "game")
+        notify("当前没有需要关闭的应用，已进入游戏模式。")
         return
-
-    # 并发极速关闭：WM_CLOSE -> 1.5s -> 批量自动强杀，0 弹窗打扰
-    res = core.close_apps(targets, cfg)
-    if res["closed"]:
-        storage.merge_pending_restore(res["closed"])
-
-    update_tray_state()
-
-    # 静默成功哲学：若无失败，完全不弹窗！仅当有应用未能关闭时才弹窗告警
-    if res["failed"]:
-        failed_names = ", ".join(a["name"] for a in res["failed"])
-        _msg_box(f"部分应用未能关闭（可能具有管理员权限或进程假死）：\n{failed_names}", "GameSwitcher - 游戏模式", MB_ICONWARN)
+    result = core.close_apps(targets, cfg, cancel=_shutdown)
+    closed = {a["id"] for a in result["closed"]}
+    ids = {a["id"] for a in targets}
+    for app in journal:
+        if app["id"] in ids:
+            app["status"] = "closed" if app["id"] in closed else "not_closed"
+    remaining = result["failed"] + result["skipped"]
+    storage.save_pending_restore(journal, "partial" if remaining or _shutdown.is_set() else "game")
+    if remaining:
+        _msg_box("以下应用尚未正常关闭，已保留运行及恢复记录；请处理保存提示或手动关闭：\n"
+                 + "\n".join(a["name"] for a in remaining))
 
 
 @threaded
-def do_restore(icon_=None, item=None):
-    if not acquire_lock():
-        notify("已有操作正在进行中，请等它完成。", warn=True)
-        return
-    try:
-        pending = storage.load_pending_restore()
-        if not pending:
-            notify("当前没有待恢复的应用。")
-            update_tray_state()
-            return
-
-        res = core.restore_apps(progress=None)
-        update_tray_state()
-
-        # 静默成功哲学：若全部唤回成功，完全不弹窗！用户直接回到工作状态
-        # 仅当有应用启动失败时才弹窗提醒用户检查
-        if res["missing"]:
-            missing_names = ", ".join(a.get("name") or a.get("exe") for a in res["missing"])
-            _msg_box(f"部分应用启动失败（文件可能被移动或删除）：\n{missing_names}", "GameSwitcher - 恢复提示", MB_ICONWARN)
-    finally:
-        release_lock()
+def do_enter_game_mode(*_):
+    _enter_game_mode()
 
 
 @threaded
-def do_discard_restore(icon_=None, item=None):
-    if not acquire_lock():
-        notify("已有操作正在进行中，请等它完成。", warn=True)
-        return
-    try:
-        pending = storage.load_pending_restore()
-        if not pending:
-            return
-        r = _msg_box(
-            f"当前快照记录了 {len(pending)} 个已挂起应用。\n\n"
-            "⚠️ 放弃恢复将清空该挂起快照，不重新启动这些应用，并将状态重置为普通就绪状态。\n\n"
-            "确定要放弃本次恢复吗？",
-            "GameSwitcher - 确认放弃恢复",
-            MB_YESNO | MB_ICONWARN
-        )
-        if r == IDYES:
-            storage.clear_pending_restore()
-            update_tray_state()
-            notify("已清空挂起快照，重置为就绪状态。")
-    finally:
-        release_lock()
-
+def do_restore(*_):
+    result = core.restore_apps(cancel=_shutdown)
+    if result["missing"]:
+        _msg_box("以下应用尚未确认恢复，记录已保留。可能需要手动确认启动、文档或窗口：\n"
+                 + "\n".join(a["name"] for a in result["missing"])
+                 + "\n\n确认程序未启动后，可选择菜单中的「重新尝试未确认启动」。")
 
 
 @threaded
-def do_show_baseline(icon_=None, item=None):
+def do_retry_restore(*_):
+    pending = storage.load_pending_restore()
+    if _msg_box("先确认相关程序确实没有打开。重新尝试可能打开重复窗口。\n确定重新尝试？",
+                flags=MB_YESNO | MB_ICONWARN) != IDYES or _shutdown.is_set():
+        return
+    for app in pending:
+        app.pop("restore_attempted", None)
+    storage.save_pending_restore(pending, "partial" if pending else "ready")
+    result = core.restore_apps(cancel=_shutdown)
+    if result["missing"]:
+        _msg_box("仍有应用未确认恢复，记录已保留。请检查日志和相关应用。")
+
+
+@threaded
+def do_discard_restore(*_):
+    state = storage.load_state()
+    if state["apps"] and _msg_box(f"确定清空 {len(state['apps'])} 条恢复记录？不会重新启动应用。",
+                                  flags=MB_YESNO | MB_ICONWARN) != IDYES:
+        return
+    if not _shutdown.is_set():
+        storage.clear_pending_restore()
+        notify("恢复记录已清空，已返回就绪状态。")
+
+
+@threaded
+def do_show_baseline(*_):
     apps = storage.load_baseline()
-    if not apps:
-        _msg_box("基线应用（游戏模式下保留运行）：\n(无，进入游戏模式将关闭所有非排除应用)", "GameSwitcher", MB_ICONINFO)
-        return
-    _msg_box("基线应用（游戏模式下保留运行）：\n- " +
-             "\n- ".join(a["name"] for a in apps), "GameSwitcher", MB_ICONINFO)
+    _msg_box("基线程序：\n" + ("\n".join(a["exe"] for a in apps) or "（空基线）"), flags=MB_ICONINFO)
 
 
-# ---------- exclude list ----------
+@threaded
+def do_refresh(*_):
+    _refresh_cache()
 
-def _add_exclude(name: str):
+
+@threaded
+def do_open_data(*_):
+    os.startfile(storage.data_dir())
+
+
+@threaded
+def _toggle_exclude(value):
     cfg = storage.load_config()
-    target_norm = os.path.normcase(name)
-    if not any(os.path.normcase(x) == target_norm for x in cfg["exclude_list"]):
-        cfg["exclude_list"].append(name)
-        storage.save_config(cfg)
-    update_tray_state()
-
-
-def _toggle_exclude(exe_name: str):
-    cfg = storage.load_config()
-    target_norm = os.path.normcase(exe_name)
-    existing_idx = next(
-        (i for i, item in enumerate(cfg["exclude_list"]) if os.path.normcase(item) == target_norm),
-        -1
-    )
-    if existing_idx != -1:
-        cfg["exclude_list"].pop(existing_idx)
+    key = os.path.normcase(value)
+    matches = [e for e in cfg["exclude_list"] if os.path.normcase(e) == key]
+    if matches:
+        cfg["exclude_list"] = [e for e in cfg["exclude_list"] if os.path.normcase(e) != key]
     else:
-        cfg["exclude_list"].append(exe_name)
+        cfg["exclude_list"].append(value)
     storage.save_config(cfg)
-    update_tray_state()
 
 
 def _exclude_submenu():
-    cfg = storage.load_config()
-    items = []
-
-    # 1. 顶部：已排除的应用列表（带 ✓，点击取消）
-    if cfg["exclude_list"]:
-        for name in cfg["exclude_list"]:
-            items.append(pystray.MenuItem(
-                f"✓ {name} (点击取消)", lambda *_, n=name: _toggle_exclude(n)))
-        items.append(pystray.Menu.SEPARATOR)
-
-    # 2. 底部：当前正在运行但未排除的应用（点击直接加入排除名单，免敲键盘）
-    running = core.visible_apps()
-    existing_norms = {os.path.normcase(e) for e in cfg["exclude_list"]}
-    candidates = []
+    items = [pystray.MenuItem("刷新运行应用列表", do_refresh, enabled=not _busy)]
+    for value in _cache["config"]["exclude_list"]:
+        items.append(pystray.MenuItem(f"✓ {value}", lambda *_, v=value: _toggle_exclude(v), enabled=not _busy))
     seen = set()
-    for a in running:
-        norm = os.path.normcase(a["name"])
-        if norm not in existing_norms and norm not in seen:
-            seen.add(norm)
-            candidates.append(a["name"])
-
-    if candidates:
-        for name in sorted(candidates)[:15]:
-            items.append(pystray.MenuItem(
-                f"+ 排除当前运行: {name}", lambda *_, n=name: _add_exclude(n)))
-    else:
-        if not cfg["exclude_list"]:
-            items.append(pystray.MenuItem("  (无已排除应用)", None, enabled=False))
-
-    items.append(pystray.Menu.SEPARATOR)
-    items.append(pystray.MenuItem("📁 打开配置与日志目录", lambda *_: os.startfile(storage.data_dir())))
-
-    return items
+    for app in sorted(_cache["running"], key=lambda a: a["exe"].lower()):
+        exe, key = app["exe"], os.path.normcase(app["exe"])
+        if key not in seen and not core.is_excluded(app, _cache["config"]["exclude_list"]):
+            seen.add(key)
+            items.append(pystray.MenuItem(f"+ {exe}", lambda *_, v=exe: _toggle_exclude(v), enabled=not _busy))
+    items.append(pystray.MenuItem("打开配置与日志目录", do_open_data, enabled=not _busy))
+    return pystray.Menu(*items)
 
 
-# ---------- autostart ----------
+def _autostart_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    script = os.path.abspath(__file__)
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return f'"{pythonw if os.path.isfile(pythonw) else sys.executable}" "{script}"'
 
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-VAL_NAME = "GameSwitcher"
 
-
-def autostart_enabled() -> bool:
+def autostart_enabled():
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            winreg.QueryValueEx(k, VAL_NAME)
-            return True
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            command, _ = winreg.QueryValueEx(key, VAL_NAME)
+        return command == _autostart_command()
     except OSError:
         return False
 
 
 @threaded
-def toggle_autostart(icon_=None, item=None):
-    script = os.path.abspath(sys.argv[0])
-    if script.lower().endswith(".py"):
-        python_dir = os.path.dirname(sys.executable)
-        pythonw = os.path.join(python_dir, "pythonw.exe")
-        if not os.path.isfile(pythonw):
-            pythonw = sys.executable
-        cmd = f'"{pythonw}" "{script}"'
-    else:
-        cmd = f'"{script}"'
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-            if autostart_enabled():
-                winreg.DeleteValue(k, VAL_NAME)
-            else:
-                winreg.SetValueEx(k, VAL_NAME, 0, winreg.REG_SZ, cmd)
-    except OSError as e:
-        notify(f"设置开机自启失败: {e}", warn=True)
-    update_tray_state()
+def toggle_autostart(*_):
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if autostart_enabled():
+            winreg.DeleteValue(key, VAL_NAME)
+        else:
+            winreg.SetValueEx(key, VAL_NAME, 0, winreg.REG_SZ, _autostart_command())
 
 
 def _exit_app(*_):
-    global _mutex_handle, _notify_timer
-    with _notify_timer_lock:
-        if _notify_timer is not None:
-            _notify_timer.cancel()
-            _notify_timer = None
-    if _mutex_handle:
-        try:
-            ctypes.windll.kernel32.CloseHandle(_mutex_handle)
-            _mutex_handle = None
-        except Exception:
-            pass
-    if icon:
-        icon.stop()
+    with _workers_lock:
+        if _shutdown.is_set():
+            return
+        _shutdown.set()
+        workers = list(_workers)
+    if _notify_timer:
+        _notify_timer.cancel()
+
+    def finish():
+        # Close only this application's worker-owned MessageBox dialogs.
+        for worker in workers:
+            if worker.native_id:
+                def close_dialog(hwnd, _):
+                    try:
+                        if (win32gui.GetClassName(hwnd) == "#32770"
+                                and win32process.GetWindowThreadProcessId(hwnd)[1] == core.SELF_PID):
+                            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                    except win32gui.error:
+                        pass
+                    return True
+                try:
+                    win32gui.EnumThreadWindows(worker.native_id, close_dialog, None)
+                except win32gui.error:
+                    pass
+            worker.join()
+        if icon:
+            icon.stop()
+        # The instance lock is released by main() only after icon.run returns.
+    threading.Thread(target=finish, name="shutdown", daemon=False).start()
 
 
 def build_menu():
-    pending = storage.load_pending_restore()
-    in_game_mode = len(pending) > 0
-    restore_text = f"✨ 恢复应用 ({len(pending)} 个已保存)" if in_game_mode else "恢复应用 (无挂起应用)"
-
-    menu_items = [
-        pystray.MenuItem("🎮 进入游戏模式（关闭并保存快照）", do_enter_game_mode),
-        pystray.MenuItem(restore_text, do_restore, enabled=in_game_mode),
-    ]
-    if in_game_mode:
-        menu_items.append(pystray.MenuItem("🗑️ 放弃恢复（清空挂起快照）", do_discard_restore))
-
-    menu_items.extend([
+    state = _cache["state"]
+    enabled = not _busy and not _shutdown.is_set()
+    return pystray.Menu(
+        pystray.MenuItem("进入游戏模式（正常关闭并保存记录）", do_enter_game_mode, enabled=enabled),
+        pystray.MenuItem(f"恢复应用（{len(state['apps'])} 条记录）", do_restore,
+                         enabled=enabled and state["mode"] != "ready"),
+        pystray.MenuItem("重新尝试未确认启动", do_retry_restore,
+                         enabled=enabled and any(a.get("restore_attempted") for a in state["apps"])),
+        pystray.MenuItem("放弃恢复 / 返回就绪", do_discard_restore,
+                         enabled=enabled and state["mode"] != "ready"),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("捕获基线（以此为准保留应用）", do_capture),
-        pystray.MenuItem("查看基线", do_show_baseline),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("排除名单（永不关闭）", pystray.Menu(_exclude_submenu)),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("开机自启", toggle_autostart, checked=lambda item: autostart_enabled()),
-        pystray.MenuItem("退出", _exit_app),
-    ])
-    menu = pystray.Menu(*menu_items)
-    if icon:
-        icon.menu = menu
-    return menu
+        pystray.MenuItem("捕获基线", do_capture, enabled=enabled),
+        pystray.MenuItem("查看基线", do_show_baseline, enabled=enabled),
+        pystray.MenuItem("排除名单（保留运行）", _exclude_submenu()),
+        pystray.MenuItem("开机自启", toggle_autostart, checked=lambda _: _cache["autostart"], enabled=enabled),
+        pystray.MenuItem("退出（安全收尾）", _exit_app),
+    )
 
 
-
-def make_icon_image(in_game_mode: bool = False) -> Image.Image:
-    """Generate dynamic tray icon based on mode."""
-    # RGBA with transparent background gives a modern circular badge on any taskbar color
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    if in_game_mode:
-        # 游戏模式：醒目电竞炽红圆环与红色三角形
-        d.ellipse((4, 4, 60, 60), fill=(45, 12, 16), outline=(255, 55, 65), width=5)
-        d.polygon([(26, 20), (26, 44), (48, 32)], fill=(255, 55, 65))
-    else:
-        # 普通模式：优雅天蓝色圆环与天蓝色三角形
-        d.ellipse((4, 4, 60, 60), fill=(20, 26, 36), outline=(100, 180, 255), width=4)
-        d.polygon([(26, 20), (26, 44), (48, 32)], fill=(100, 180, 255))
-    return img
-
+def make_icon_image(in_game_mode=False):
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    color = (255, 55, 65) if in_game_mode else (100, 180, 255)
+    draw.ellipse((4, 4, 60, 60), fill=(20, 26, 36), outline=color, width=4)
+    draw.polygon([(26, 20), (26, 44), (48, 32)], fill=color)
+    return image
 
 
 def update_tray_state():
-    """Sync tray visual icon, tooltip title and menu to current mode."""
     if not icon:
         return
-    pending = storage.load_pending_restore()
-    in_game = len(pending) > 0
-    icon.icon = make_icon_image(in_game_mode=in_game)
-    if in_game:
-        icon.title = f"GameSwitcher - 🎮 游戏模式中 ({len(pending)} 个应用已挂起)"
-    else:
-        icon.title = "GameSwitcher - 就绪 (普通模式)"
-    build_menu()
+    state = _cache["state"]
+    labels = {"ready": "就绪", "entering": "上次进入未完成", "game": "游戏模式",
+              "partial": "部分操作待处理", "restoring": "上次恢复未完成"}
+    icon.icon = make_icon_image(state["mode"] != "ready")
+    icon.title = f"GameSwitcher - {'操作中' if _busy else labels[state['mode']]}（{len(state['apps'])} 条恢复记录）"
+    icon.menu = build_menu()
 
 
 def main():
     global icon
     setup_logging()
-    log.info("GameSwitcher starting")
-    if already_running():
-        log.info("another instance is running, exiting")
-        _msg_box("GameSwitcher 已经在运行了（看屏幕右下角托盘区，圆形图标）。", "GameSwitcher", MB_ICONINFO)
-        return
+    try:
+        if already_running():
+            _msg_box("GameSwitcher 已经在运行。", flags=MB_ICONINFO)
+            return
+        storage.load_baseline()
+        _refresh_cache()
+        state = _cache["state"]
+        icon = TrayIcon("GameSwitcher", make_icon_image(state["mode"] != "ready"), "GameSwitcher", build_menu())
+        icon.dispatch(update_tray_state)
+        icon.run(setup=lambda tray: tray.dispatch(lambda: setattr(tray, "visible", True)))
+    except Exception as exc:
+        log.exception("startup/main loop failed")
+        _msg_box(f"GameSwitcher 无法继续运行：{exc}\n配置文件保持原样。\n{_data_location()}")
+    finally:
+        _exit_app()
+        with _workers_lock:
+            workers = list(_workers)
+        for worker in workers:
+            worker.join()
+        _release_instance()
 
-    pending = storage.load_pending_restore()
-    in_game = len(pending) > 0
-    initial_title = f"GameSwitcher - 🎮 游戏模式中 ({len(pending)} 个应用已挂起)" if in_game else "GameSwitcher - 就绪 (普通模式)"
 
-    icon = pystray.Icon("GameSwitcher", make_icon_image(in_game_mode=in_game),
-                        initial_title, build_menu())
-    icon.run()
+def run_self_test(report_path=None):
+    """Check the packaged native UI without showing a tray or closing any app."""
+    import json
+    import tempfile
+    from io import BytesIO
+    from contextlib import ExitStack
+
+    global icon
+    previous_appdata = os.environ.get("APPDATA")
+    finished = threading.Event()
+    result = {"ok": False}
+
+    def watchdog():
+        if not finished.wait(15):
+            os._exit(2)  # this isolated self-test process only
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="gameswitcher-self-test-") as directory, ExitStack() as cleanup:
+            cleanup.callback(_release_instance)
+            os.environ["APPDATA"] = directory
+            mutex_name = f"Local\\GameSwitcher_Smoke_{os.getpid()}"
+            if already_running(mutex_name):
+                raise RuntimeError("self-test instance unexpectedly locked")
+            result["single_instance_excluded"] = already_running(mutex_name)
+            storage.save_baseline([])
+            storage.merge_pending_restore([], "game")
+            _refresh_cache()
+            result["enumerated_instances"] = len(_cache["running"])
+            for mode in (False, True):
+                make_icon_image(mode).save(BytesIO(), format="ICO")
+            ui_thread = threading.get_ident()
+            done = threading.Event()
+            icon = TrayIcon("GameSwitcher-Smoke", make_icon_image(), "Smoke", build_menu())
+
+            def setup(tray):
+                def update():
+                    update_tray_state()
+                    result["dispatch_on_ui_thread"] = threading.get_ident() == ui_thread
+                    done.set()
+                tray.dispatch(update)
+                done.wait(5)
+                tray.stop()
+
+            icon.run(setup=setup)  # supplied setup keeps the tray invisible
+            result["state_after_restart"] = storage.load_state()["mode"]
+            result["ok"] = (result.get("dispatch_on_ui_thread", False)
+                            and result["single_instance_excluded"] and result["state_after_restart"] == "game")
+            _release_instance()
+    except Exception as exc:
+        log.exception("self-test failed")
+        result["error"] = str(exc)
+    finally:
+        finished.set()
+        _release_instance()
+        icon = None
+        if previous_appdata is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = previous_appdata
+    if report_path:
+        with open(report_path, "w", encoding="utf-8") as stream:
+            json.dump(result, stream, ensure_ascii=False, indent=2)
+    if sys.stdout:
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    return result
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        result = run_self_test(sys.argv[2] if len(sys.argv) > 2 else None)
+        raise SystemExit(0 if result["ok"] else 1)
     main()

@@ -6,6 +6,8 @@ __pycache__/
 # PyInstaller build and distribution
 build/
 dist/
+dist-fixed/
+build-fixed/
 *.spec.bak
 
 # Local logs and runtime data
