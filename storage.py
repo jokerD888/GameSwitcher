@@ -165,6 +165,8 @@ def load_state():
     if raw["mode"] == "ready" and apps:
         raise StorageError("就绪状态不能包含待恢复记录")
     action = raw.get("action") or (apps[0].get("action") if apps else "suspend")
+    if action not in {"suspend", "close"}:
+        action = "suspend"
     return {"version": 2, "mode": raw["mode"], "action": action, "apps": apps}
 
 
@@ -179,6 +181,10 @@ def save_pending_restore(apps, mode=None, action=None):
         raise StorageError("无效操作状态")
     if mode == "ready" and apps:
         raise StorageError("就绪状态不能包含待恢复记录")
+    if action:
+        for app in apps:
+            if "action" not in app:
+                app["action"] = action
     data = {"version": 2, "mode": mode, "apps": apps}
     if action:
         data["action"] = action
@@ -193,7 +199,6 @@ def merge_pending_restore(new_apps, mode="entering", action=None):
         merged[app["id"]] = app
     result = list(merged.values())
     save_pending_restore(result, mode, action=action)
-    return result
     return result
 
 

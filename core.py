@@ -27,6 +27,35 @@ SYSTEM_EXES = {
 }
 PROCESS_GONE = (psutil.NoSuchProcess, psutil.ZombieProcess)
 
+# Win32 API configurations with 64-bit safe ctypes definitions
+_kernel32 = ctypes.windll.kernel32
+_ntdll = ctypes.windll.ntdll
+_psapi = ctypes.windll.psapi
+_user32 = ctypes.windll.user32
+
+_kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+_kernel32.OpenProcess.restype = ctypes.c_void_p
+
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+_kernel32.CloseHandle.restype = ctypes.c_int
+
+_ntdll.NtSuspendProcess.argtypes = [ctypes.c_void_p]
+_ntdll.NtSuspendProcess.restype = ctypes.c_long
+
+_ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+_ntdll.NtResumeProcess.restype = ctypes.c_long
+
+_psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+_psapi.EmptyWorkingSet.restype = ctypes.c_int
+
+_user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.ShowWindowAsync.restype = ctypes.c_int
+
+# Process access masks: PROCESS_SUSPEND_RESUME (0x0800), SET_QUOTA (0x0100), QUERY_INFO (0x0400)
+PROCESS_SUSPEND_QUOTA = 0x0800 | 0x0100 | 0x0400
+PROCESS_RESUME = 0x0800
+PROCESS_ALL_ACCESS = 0x1F0FFF
+
 
 class ScanError(RuntimeError):
     pass
@@ -147,7 +176,7 @@ def _matches(app):
     """True = same live process; False = gone/replaced; None = access unknown."""
     try:
         proc = psutil.Process(app["pid"])
-        return (proc.create_time() == app["birth"] and path_key(proc.exe()) == path_key(app["exe"])
+        return (abs(proc.create_time() - app["birth"]) < 0.001 and path_key(proc.exe()) == path_key(app["exe"])
                 and proc.username().lower() == app["username"].lower() and _session_id(proc.pid) == app["session"])
     except PROCESS_GONE:
         return False
@@ -230,29 +259,29 @@ def _suspend_process_tree(pid):
     success_pids = []
     for p in pids:
         try:
-            h = ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, p)
+            h = _kernel32.OpenProcess(PROCESS_SUSPEND_QUOTA, False, p) or _kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, p)
             if h:
                 try:
-                    ctypes.windll.ntdll.NtSuspendProcess(h)
-                    ctypes.windll.psapi.EmptyWorkingSet(h)
-                    success_pids.append(p)
+                    if _ntdll.NtSuspendProcess(h) == 0:
+                        _psapi.EmptyWorkingSet(h)
+                        success_pids.append(p)
                 finally:
-                    ctypes.windll.kernel32.CloseHandle(h)
+                    _kernel32.CloseHandle(h)
         except Exception as e:
             log.warning("failed to suspend pid=%s: %s", p, e)
     return pids, success_pids
 
 
 def _resume_process_tree(pids):
-    """Resume all threads in the process tree in reverse order."""
-    for p in reversed(pids):
+    """Resume all threads in the process tree."""
+    for p in dict.fromkeys(pids):
         try:
-            h = ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, p)
+            h = _kernel32.OpenProcess(PROCESS_RESUME, False, p) or _kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, p)
             if h:
                 try:
-                    ctypes.windll.ntdll.NtResumeProcess(h)
+                    _ntdll.NtResumeProcess(h)
                 finally:
-                    ctypes.windll.kernel32.CloseHandle(h)
+                    _kernel32.CloseHandle(h)
         except Exception as e:
             log.warning("failed to resume pid=%s: %s", p, e)
 
@@ -261,7 +290,7 @@ def _hide_windows(hwnds):
     for hwnd in hwnds:
         try:
             if win32gui.IsWindow(hwnd):
-                ctypes.windll.user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
+                _user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
         except Exception as e:
             log.debug("failed to hide hwnd=%s: %s", hwnd, e)
 
@@ -270,7 +299,7 @@ def _show_windows(hwnds):
     for hwnd in hwnds:
         try:
             if win32gui.IsWindow(hwnd):
-                ctypes.windll.user32.ShowWindowAsync(hwnd, win32con.SW_RESTORE)
+                _user32.ShowWindowAsync(hwnd, win32con.SW_SHOW)
         except Exception as e:
             log.debug("failed to show hwnd=%s: %s", hwnd, e)
 
@@ -298,17 +327,20 @@ def suspend_apps(target_apps, cancel=None):
     result = {"suspended": [], "failed": []}
     for app in apps:
         if cancel and cancel.is_set():
-            break
+            _show_windows(app.get("hwnds", []))
+            result["failed"].append(app)
+            continue
         if _matches(app) is not True:
+            _show_windows(app.get("hwnds", []))
             result["failed"].append(app)
             continue
         all_pids, suspended_pids = _suspend_process_tree(app["pid"])
         if suspended_pids:
-            app["tree_pids"] = all_pids
+            app["tree_pids"] = suspended_pids
             app["action"] = "suspend"
             app["status"] = "suspended"
             result["suspended"].append(app)
-            log.info("suspended app id=%s name=%s tree_pids=%s", app["id"], app["name"], all_pids)
+            log.info("suspended app id=%s name=%s tree_pids=%s", app["id"], app["name"], suspended_pids)
         else:
             _show_windows(app.get("hwnds", []))
             result["failed"].append(app)
@@ -321,13 +353,15 @@ def discard_apps(pending_apps):
     """Clean up pending apps: terminate any suspended processes so they don't linger."""
     for app in pending_apps:
         if app.get("action") == "suspend":
-            for pid in app.get("tree_pids", [app.get("pid")]):
-                if pid and psutil.pid_exists(pid):
-                    try:
-                        p = psutil.Process(pid)
-                        p.terminate()
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
+            if _matches(app) is True:
+                pids = app.get("tree_pids") or [app.get("pid")]
+                for pid in reversed(list(dict.fromkeys(pids))):
+                    if pid and psutil.pid_exists(pid):
+                        try:
+                            p = psutil.Process(pid)
+                            p.terminate()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
 
 
 def resume_all_suspended(pending_apps):
@@ -397,7 +431,9 @@ def launch_app(app, timeout=8, cancel=None):
 
 def restore_apps(progress=None, cancel=None):
     cfg = storage.load_config()
-    pending = storage.load_pending_restore()
+    state = storage.load_state()
+    pending = state["apps"]
+    default_action = state.get("action", "suspend")
     result = {"restored": [], "already_running": [], "missing": []}
     current = visible_apps()
     consumed = set()
@@ -409,7 +445,7 @@ def restore_apps(progress=None, cancel=None):
                 break
             if progress:
                 progress(f"恢复 {app['name']} ({index + 1}/{len(pending)})")
-            action = app.get("action", "close")
+            action = app.get("action") or default_action
             if action == "suspend":
                 alive = _matches(app)
                 if alive is True:
