@@ -253,7 +253,7 @@ def do_capture(*_):
              flags=MB_ICONINFO)
 
 
-def _enter_game_mode():
+def _enter_game_mode(action="suspend"):
     cfg = storage.load_config()
     baseline = storage.load_baseline()
     storage.load_state()  # fail before any window messages if the old journal is corrupt
@@ -261,33 +261,58 @@ def _enter_game_mode():
         _msg_box("请先在干净环境中捕获基线，再进入游戏模式。", flags=MB_ICONINFO)
         return
     baseline_exes = {core.path_key(a["exe"]) for a in baseline}
-    targets = [dict(a, status="prepared") for a in core.visible_apps()
+    targets = [dict(a, status="prepared", action=action) for a in core.visible_apps()
                if core.path_key(a["exe"]) not in baseline_exes
                and not core.is_excluded(a, cfg["exclude_list"])]
     if _shutdown.is_set():
         return
-    # Durable intent precedes the very first WM_CLOSE. A write failure aborts.
-    journal = storage.merge_pending_restore(targets, "entering")
+    journal = storage.merge_pending_restore(targets, "entering", action=action)
     if not targets:
-        storage.save_pending_restore(journal, "game")
-        notify("当前没有需要关闭的应用，已进入游戏模式。")
+        storage.save_pending_restore(journal, "game", action=action)
+        notify("当前没有需要处理的非基线应用，已进入游戏模式。")
         return
-    result = core.close_apps(targets, cfg, cancel=_shutdown)
-    closed = {a["id"] for a in result["closed"]}
-    ids = {a["id"] for a in targets}
-    for app in journal:
-        if app["id"] in ids:
-            app["status"] = "closed" if app["id"] in closed else "not_closed"
-    remaining = result["failed"] + result["skipped"]
-    storage.save_pending_restore(journal, "partial" if remaining or _shutdown.is_set() else "game")
-    if remaining:
-        _msg_box("以下应用尚未正常关闭，已保留运行及恢复记录；请处理保存提示或手动关闭：\n"
-                 + "\n".join(a["name"] for a in remaining))
+
+    if action == "suspend":
+        result = core.suspend_apps(targets, cancel=_shutdown)
+        suspended_ids = {a["id"] for a in result["suspended"]}
+        targets_by_id = {t["id"]: t for t in targets}
+        for app in journal:
+            if app["id"] in targets_by_id:
+                app["action"] = "suspend"
+                if app["id"] in suspended_ids:
+                    app["status"] = "suspended"
+                    if "tree_pids" in targets_by_id[app["id"]]:
+                        app["tree_pids"] = targets_by_id[app["id"]]["tree_pids"]
+                else:
+                    app["status"] = "not_closed"
+        remaining = result["failed"]
+        storage.save_pending_restore(journal, "partial" if remaining or _shutdown.is_set() else "game", action="suspend")
+        if remaining:
+            _msg_box("以下应用未能成功挂起，已保留恢复记录：\n"
+                     + "\n".join(a["name"] for a in remaining))
+    else:
+        result = core.close_apps(targets, cfg, cancel=_shutdown)
+        closed = {a["id"] for a in result["closed"]}
+        ids = {a["id"] for a in targets}
+        for app in journal:
+            if app["id"] in ids:
+                app["status"] = "closed" if app["id"] in closed else "not_closed"
+                app["action"] = "close"
+        remaining = result["failed"] + result["skipped"]
+        storage.save_pending_restore(journal, "partial" if remaining or _shutdown.is_set() else "game", action="close")
+        if remaining:
+            _msg_box("以下应用尚未正常关闭，已保留运行及恢复记录；请处理保存提示或手动关闭：\n"
+                     + "\n".join(a["name"] for a in remaining))
 
 
 @threaded
-def do_enter_game_mode(*_):
-    _enter_game_mode()
+def do_enter_suspend_mode(*_):
+    _enter_game_mode(action="suspend")
+
+
+@threaded
+def do_enter_close_mode(*_):
+    _enter_game_mode(action="close")
 
 
 @threaded
@@ -316,10 +341,11 @@ def do_retry_restore(*_):
 @threaded
 def do_discard_restore(*_):
     state = storage.load_state()
-    if state["apps"] and _msg_box(f"确定清空 {len(state['apps'])} 条恢复记录？不会重新启动应用。",
+    if state["apps"] and _msg_box(f"确定清空 {len(state['apps'])} 条恢复记录？\n挂起中的程序将被安全关闭释放资源。",
                                   flags=MB_YESNO | MB_ICONWARN) != IDYES:
         return
     if not _shutdown.is_set():
+        core.discard_apps(state["apps"])
         storage.clear_pending_restore()
         notify("恢复记录已清空，已返回就绪状态。")
 
@@ -393,6 +419,14 @@ def toggle_autostart(*_):
 
 
 def _exit_app(*_):
+    # Safely resume any suspended applications on exit
+    try:
+        state = storage.load_state()
+        if state["apps"]:
+            core.resume_all_suspended(state["apps"])
+    except Exception:
+        log.exception("failed to resume suspended apps on exit")
+
     with _workers_lock:
         if _shutdown.is_set():
             return
@@ -427,14 +461,20 @@ def _exit_app(*_):
 def build_menu():
     state = _cache["state"]
     enabled = not _busy and not _shutdown.is_set()
+    in_game = state["mode"] != "ready"
+    action = state.get("action", "suspend")
+    action_label = "保留现场" if action == "suspend" else "彻底清场"
     return pystray.Menu(
-        pystray.MenuItem("进入游戏模式（正常关闭并保存记录）", do_enter_game_mode, enabled=enabled),
-        pystray.MenuItem(f"恢复应用（{len(state['apps'])} 条记录）", do_restore,
-                         enabled=enabled and state["mode"] != "ready"),
+        pystray.MenuItem("🚀 进入游戏（保留现场 · 推荐）", do_enter_suspend_mode,
+                         enabled=enabled and not in_game),
+        pystray.MenuItem("🧹 彻底清场（极度纯净 · 关机首选）", do_enter_close_mode,
+                         enabled=enabled and not in_game),
+        pystray.MenuItem(f"✨ 恢复应用（{len(state['apps'])} 个已保存 · {action_label}）" if in_game else "✨ 恢复应用（无挂起记录）",
+                         do_restore, enabled=enabled and in_game),
         pystray.MenuItem("重新尝试未确认启动", do_retry_restore,
                          enabled=enabled and any(a.get("restore_attempted") for a in state["apps"])),
-        pystray.MenuItem("放弃恢复 / 返回就绪", do_discard_restore,
-                         enabled=enabled and state["mode"] != "ready"),
+        pystray.MenuItem("🗑️ 放弃恢复 / 返回就绪", do_discard_restore,
+                         enabled=enabled and in_game),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("捕获基线", do_capture, enabled=enabled),
         pystray.MenuItem("查看基线", do_show_baseline, enabled=enabled),
@@ -457,10 +497,13 @@ def update_tray_state():
     if not icon:
         return
     state = _cache["state"]
-    labels = {"ready": "就绪", "entering": "上次进入未完成", "game": "游戏模式",
+    action_tag = "保留现场" if state.get("action") == "suspend" else "彻底清场"
+    labels = {"ready": "就绪", "entering": "上次进入未完成",
+              "game": f"游戏模式[{action_tag}]",
               "partial": "部分操作待处理", "restoring": "上次恢复未完成"}
     icon.icon = make_icon_image(state["mode"] != "ready")
-    icon.title = f"GameSwitcher - {'操作中' if _busy else labels[state['mode']]}（{len(state['apps'])} 条恢复记录）"
+    mode_text = labels.get(state["mode"], "就绪")
+    icon.title = f"GameSwitcher - {'操作中' if _busy else mode_text}（{len(state['apps'])} 个应用记录）"
     icon.menu = build_menu()
 
 
