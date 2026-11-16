@@ -12,6 +12,8 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python main.py --self-test
       - run: python tests/window_integration.py
+      - run: python -m PyInstaller tests/window_fixture.py --onefile --noconsole --name SuspensionFixture --distpath dist-fixed/fixtures --workpath build-fixed/fixture --specpath build-fixed/fixture --noconfirm
+      - run: python tests/suspension_integration.py
       - run: python -m PyInstaller GameSwitcher.spec --noconfirm
       - name: Check packaged native UI
         shell: pwsh
@@ -20,3 +22,4 @@ jobs:
           if ($fixture.ExitCode -ne 0) { throw "Packaged self-test failed: $($fixture.ExitCode)" }
           $report = Get-Content packaged-smoke.json -Raw | ConvertFrom-Json
           if (-not $report.ok) { throw 'Packaged self-test did not confirm success' }
+      - run: python tests/packaged_suspension_smoke.py dist/GameSwitcher.exe

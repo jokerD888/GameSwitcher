@@ -1,72 +1,53 @@
-# GameSwitcher — Instant Gaming & Work Mode Companion (Dual-Mode Edition)
+# GameSwitcher — Desktop and gaming mode switcher
 
-> Free up CPU and RAM with one click before gaming; restore your entire workspace in milliseconds afterward.  
-> **Innovative Dual-Mode Architecture**: Supports both "Deep Freeze (Preserve State)" and "Clean Purge (Extreme Performance)". Silent, zero popups, single portable executable.
+A Windows tray utility with two modes:
 
----
+- **A: Normal closure.** Save launch information, request normal closure, and reopen later. Surviving applications are not forcibly terminated.
+- **B: Suspend and preserve context.** Minimize validated application windows, pause their validated processes, and resume the same processes later.
 
-## 📥 Download & Run
+## Complete process baseline
 
-👉 **[Go to GitHub Releases to download the latest GameSwitcher.exe](https://github.com/jokerD888/GameSwitcher/releases)**
+Capture in a clean desktop environment after startup. The baseline includes every accessible process path in the current user/session, including tray and windowless applications. Legacy window-only or empty baselines must be recaptured before Mode B becomes available.
 
-- **Single Portable Executable**: Standalone `GameSwitcher.exe` (~7.8 MB). Double-click to run with zero installation or bloat.
-- **Zero Dependencies**: Bundles an optimized Python runtime internally; no external dependencies required.
-- **Clean Persistence**: Snapshots and configurations live safely in `%APPDATA%\GameSwitcher\`.
+Mode B starts from non-baseline visible applications and checks every descendant against baseline, exclusions, user/session, process identity and system protection. A tree containing a protected member is preserved. Helpers of protected applications remain protected; Explorer and other launchers do not implicitly protect every later application.
 
----
+Remote-control/input applications such as GameViewer, ToDesk, AnyDesk, TeamViewer and AutoHotkey, and their dependency families, are retained. A preview lists candidate applications, process counts and reasons for keeping applications running.
 
-## 🌟 Core Features: Dual-Mode Architecture
+## Suspension recovery
 
-| Dimension | 🚀 Mode B: Deep Freeze (Preserve State · Recommended) | 🧹 Mode A: Clean Purge (Extreme Performance · Shutdown First) |
-| :--- | :--- | :--- |
-| **How It Works** | `NtSuspendProcess` thread freezing + `EmptyWorkingSet` memory swap to SSD | Gentle `WM_CLOSE` broadcast + fast batch cleanup |
-| **CPU Usage** | **0.00%** (All threads suspended, yielding 100% CPU to the game) | **0.00%** (Processes completely terminated) |
-| **Physical RAM** | **Plummets to 0.00 MB** (Forced out of physical RAM to SSD Pagefile) | **100% Fully Released** |
-| **Workspace State** | **🌟 100% Lossless! Unsaved drafts, cursor positions, tabs intact** | Relaunches applications cleanly |
-| **Restore Speed** | **Instantaneous revival in milliseconds** | Cold-starts applications sequentially |
-| **Ideal For** | Quick gaming breaks during work, coding, browsing | Heavy 3A games, or before going to sleep |
+- Durable identity/transaction records precede native suspension. Overlapping process trees are deduplicated.
+- A separate guardian holds verified process handles and owns each suspend/resume operation.
+- Confirm normal keyboard/mouse/desktop behavior within **12 seconds** after trial suspension; otherwise the guardian rolls back.
+- **Ctrl+Alt+F12** triggers emergency recovery. A conflicting hotkey prevents suspension.
+- Tray responsiveness loss for approximately five seconds, tray process death or normal exit causes recovery.
+- Window placement is retained. Failed recovery keeps its journal. Discard first releases suspension owned by this utility rather than terminating applications.
 
----
+Mode B does not call EmptyWorkingSet or change page-file settings. Windows manages paging. There is no guarantee of 0 MB RAM or instantaneous recovery. Unsaved memory cannot survive process exit, reboot or power loss; the JSON is not a memory image.
 
-## 🚀 Quick Start (Just 3 Steps)
+The guardian cannot cover kernel failure, power loss or killing both the tray and guardian. Some applications remain unsuitable for suspension. Preview targets and verify input during the confirmation window.
 
-1. **Place & Run**: Download `GameSwitcher.exe`, put it in any folder, and run it. It sits in your bottom-right system tray.
-2. **Capture Baseline**: On a freshly booted clean desktop (with only your essential startup software running), right-click tray icon → **「捕获基线」(Capture Baseline)**. Only needed once.
-3. **Daily Gaming**:
-   - **Before Gaming**: Right-click tray icon and choose your mode:
-     - **「🚀 进入游戏（保留现场 · 推荐）」(Deep Freeze · Recommended)** — Keep your entire workspace intact!
-     - **「🧹 彻底清场（极度纯净 · 关机首选）」(Clean Purge)** — Release all memory and VRAM!
-   - **After Gaming**: Right-click tray icon → **「✨ 恢复应用」(Restore Apps)** to resume immediately.
-   - **Going to Sleep**: Right-click tray icon → **「🗑️ 放弃恢复 / 返回就绪」(Discard Restore)** to clear state.
+Legacy PID-only suspension records are not blindly resumed or killed. After restarting Windows, recover them as launch information. Explicit restart confirmation is available for ambiguous Fast Startup cases; it verifies that original processes are gone and backs up the journal.
 
----
+Data lives in %APPDATA%\GameSwitcher. Exit safely before editing it. Do not run an old version against upgraded snapshots.
 
-## 🛡️ Smart Exclusion List
+## Development
 
-Exclude voice apps (Discord, YY, OBS, Game Accelerators) with zero typing:
-- Right-click tray icon → **「排除名单（保留运行）」(Exclusion List)**.
-- Running apps are automatically listed; click any app to toggle exclusion on/off.
+Windows / Python 3.13:
 
----
-
-## 💡 Engineering Highlights
-
-1. **Anti-Ghost Window Technology**: Before freezing, GameSwitcher calls `ShowWindowAsync(SW_HIDE)` to unmap top-level windows from DWM, eliminating "Not Responding" prompts and gray screens.
-2. **Process Tree Coverage**: Recursively scans and suspends all child processes for multi-process applications like Chrome, Edge, and VS Code.
-3. **Exit Safety Recovery**: If GameSwitcher exits, all suspended processes are automatically resumed and their windows restored.
-4. **Ultra Lightweight**: Single file ~7.8 MB, idle memory ~6.7 MB, 0% CPU footprint.
-
----
-
-## 🛠️ Build & Smoke Test
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run silent self-test
+~~~powershell
+python -m pip install -r requirements-build.txt
+python -m unittest discover -s tests -v
 python main.py --self-test
+python tests/window_integration.py
 
-# Build standalone executable
+python -m PyInstaller tests/window_fixture.py --onefile --noconsole --name SuspensionFixture --distpath dist-fixed/fixtures --workpath build-fixed/fixture --specpath build-fixed/fixture --noconfirm
+python tests/suspension_integration.py
+
 python -m PyInstaller GameSwitcher.spec --noconfirm
-```
+python tests/packaged_smoke.py dist/GameSwitcher.exe
+python tests/packaged_suspension_smoke.py dist/GameSwitcher.exe
+~~~
+
+Regression tests mock application operations. Native suspension tests use only their own offscreen fixture executable. Windows CI tests normal restoration, confirmation/heartbeat timeouts, the rescue hotkey, parent process death and the packaged executable.
+
+[Historical releases](https://github.com/jokerD888/GameSwitcher/releases) may predate these fixes.

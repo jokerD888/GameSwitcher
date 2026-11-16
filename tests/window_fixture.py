@@ -10,6 +10,7 @@ import win32gui
 parser = argparse.ArgumentParser()
 parser.add_argument("--ready", required=True)
 parser.add_argument("--accept-close", action="store_true")
+parser.add_argument("--with-owned", action="store_true")
 args = parser.parse_args()
 STOP = win32con.WM_APP + 55
 
@@ -36,8 +37,19 @@ hwnd = win32gui.CreateWindowEx(win32con.WS_EX_TOOLWINDOW, atom, "GameSwitcher te
                               win32con.WS_OVERLAPPEDWINDOW, -32000, -32000, 100, 100,
                               0, 0, instance, None)
 win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+owned = None
+if args.with_owned:
+    owned_class = win32gui.WNDCLASS()
+    owned_class.hInstance = instance
+    owned_class.lpszClassName = f"GameSwitcher-Fixture-Owned-{os.getpid()}"
+    owned_class.lpfnWndProc = lambda h, m, w, l: win32gui.DefWindowProc(h, m, w, l)
+    owned_atom = win32gui.RegisterClass(owned_class)
+    owned = win32gui.CreateWindowEx(win32con.WS_EX_TOOLWINDOW, owned_atom, "Owned dialog",
+                                    win32con.WS_POPUP | win32con.WS_CAPTION, -32000, -32000, 80, 80,
+                                    hwnd, 0, instance, None)
+    win32gui.ShowWindow(owned, win32con.SW_SHOWNOACTIVATE)
 ready = Path(args.ready)
 temporary = ready.with_suffix(".tmp")
-temporary.write_text(json.dumps({"pid": os.getpid(), "hwnd": hwnd}), encoding="utf-8")
+temporary.write_text(json.dumps({"pid": os.getpid(), "hwnd": hwnd, "owned_hwnd": owned}), encoding="utf-8")
 os.replace(temporary, ready)
 win32gui.PumpMessages()

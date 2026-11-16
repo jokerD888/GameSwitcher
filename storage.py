@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 import time
 
@@ -128,6 +129,9 @@ def validate_apps(apps, source):
         if "tree_pids" in app and (not isinstance(app["tree_pids"], list)
                                    or any(type(p) is not int or p <= 0 for p in app["tree_pids"])):
             raise StorageError(f"{source} 含无效进程树 PID 列表")
+        if "suspend_id" in app and (not isinstance(app["suspend_id"], str)
+                                   or not re.fullmatch(r"[0-9a-f]{32}", app["suspend_id"])):
+            raise StorageError(f"{source} 含无效挂起事务标识")
         if app.get("status", "prepared") not in {"prepared", "closed", "not_closed", "suspended"}:
             raise StorageError(f"{source} 含无效应用状态")
         if "id" not in app:
@@ -145,18 +149,35 @@ def baseline_exists():
     return _load(BASELINE_FILE, sentinel) is not sentinel
 
 
-def save_baseline(apps):
+def save_baseline(apps, full_processes=False):
     valid = validate_apps(apps, BASELINE_FILE)
     paths = {os.path.normcase(a["exe"]): a["exe"] for a in valid}
-    _save(BASELINE_FILE, [{"exe": exe, "name": os.path.basename(exe)} for exe in paths.values()])
+    records = [{"exe": exe, "name": os.path.basename(exe)} for exe in paths.values()]
+    if full_processes:
+        if not records:
+            raise StorageError("完整进程基线不能为空，未覆盖原基线")
+        _save(BASELINE_FILE, {"version": 2, "kind": "user-session-processes", "apps": records})
+    else:
+        _save(BASELINE_FILE, records)
 
 
 def load_baseline():
-    return validate_apps(_load(BASELINE_FILE, []), BASELINE_FILE)
+    raw = _load(BASELINE_FILE, [])
+    if isinstance(raw, dict):
+        if raw.get("version") != 2 or raw.get("kind") != "user-session-processes":
+            raise StorageError("baseline.json 含无效基线类型")
+        raw = raw.get("apps")
+    return validate_apps(raw, BASELINE_FILE)
+
+
+def full_baseline_available():
+    raw = _load(BASELINE_FILE, [])
+    apps = load_baseline()
+    return isinstance(raw, dict) and raw.get("kind") == "user-session-processes" and bool(apps)
 
 
 def load_state():
-    raw = _load(PENDING_RESTORE_FILE, {"version": 2, "mode": "ready", "action": "suspend", "apps": []})
+    raw = _load(PENDING_RESTORE_FILE, {"version": 2, "mode": "ready", "action": "close", "apps": []})
     if isinstance(raw, list):
         raw = {"version": 2, "mode": "game" if raw else "ready", "action": "close", "apps": raw}
     if (not isinstance(raw, dict) or raw.get("version") != 2 or raw.get("mode") not in MODES):
@@ -164,9 +185,12 @@ def load_state():
     apps = validate_apps(raw.get("apps"), PENDING_RESTORE_FILE)
     if raw["mode"] == "ready" and apps:
         raise StorageError("就绪状态不能包含待恢复记录")
-    action = raw.get("action") or (apps[0].get("action") if apps else "suspend")
+    action = raw.get("action", "close")
     if action not in {"suspend", "close"}:
-        action = "suspend"
+        raise StorageError("pending_restore.json 含无效操作类型")
+    for app in apps:
+        # 10c0668 snapshots have neither field and represent normal closure.
+        app.setdefault("action", "suspend" if app.get("status") == "suspended" else action)
     return {"version": 2, "mode": raw["mode"], "action": action, "apps": apps}
 
 
@@ -175,6 +199,8 @@ def load_pending_restore():
 
 
 def save_pending_restore(apps, mode=None, action=None):
+    if action is not None and action not in {"close", "suspend"}:
+        raise StorageError("无效操作类型")
     apps = validate_apps(apps, PENDING_RESTORE_FILE)
     mode = mode or ("game" if apps else "ready")
     if mode not in MODES:

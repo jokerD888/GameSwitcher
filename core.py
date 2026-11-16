@@ -27,36 +27,6 @@ SYSTEM_EXES = {
 }
 PROCESS_GONE = (psutil.NoSuchProcess, psutil.ZombieProcess)
 
-# Win32 API configurations with 64-bit safe ctypes definitions
-_kernel32 = ctypes.windll.kernel32
-_ntdll = ctypes.windll.ntdll
-_psapi = ctypes.windll.psapi
-_user32 = ctypes.windll.user32
-
-_kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
-_kernel32.OpenProcess.restype = ctypes.c_void_p
-
-_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-_kernel32.CloseHandle.restype = ctypes.c_int
-
-_ntdll.NtSuspendProcess.argtypes = [ctypes.c_void_p]
-_ntdll.NtSuspendProcess.restype = ctypes.c_long
-
-_ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
-_ntdll.NtResumeProcess.restype = ctypes.c_long
-
-_psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
-_psapi.EmptyWorkingSet.restype = ctypes.c_int
-
-_user32.ShowWindowAsync.argtypes = [ctypes.c_void_p, ctypes.c_int]
-_user32.ShowWindowAsync.restype = ctypes.c_int
-
-# Process access masks: PROCESS_SUSPEND_RESUME (0x0800), SET_QUOTA (0x0100), QUERY_INFO (0x0400)
-PROCESS_SUSPEND_QUOTA = 0x0800 | 0x0100 | 0x0400
-PROCESS_RESUME = 0x0800
-PROCESS_ALL_ACCESS = 0x1F0FFF
-
-
 class ScanError(RuntimeError):
     pass
 
@@ -87,6 +57,31 @@ def _scope():
         return own.username().lower(), _session_id(SELF_PID), {SELF_PID, 0, 4, *(p.pid for p in own.parents())}
     except (psutil.Error, OSError) as exc:
         raise ScanError("无法确定当前用户、会话或祖先进程，已停止扫描") from exc
+
+
+def process_inventory():
+    """Snapshot identities/parentage without reading command lines or requiring windows."""
+    result = []
+    try:
+        for proc in psutil.process_iter(["pid", "ppid", "exe", "username", "create_time"]):
+            info = proc.info
+            try:
+                session = _session_id(proc.pid)
+            except (OSError, psutil.Error):
+                session = -1
+            result.append({"pid": proc.pid, "ppid": info.get("ppid", 0),
+                           "exe": info.get("exe") or "", "birth": info.get("create_time"),
+                           "username": (info.get("username") or "").lower(), "session": session})
+    except psutil.Error as exc:
+        raise ScanError("完整进程扫描失败，未修改基线") from exc
+    return result
+
+
+def baseline_processes():
+    """Capture all accessible processes of this user/session, including tray/background apps."""
+    username, session, _ = _scope()
+    return [{"exe": p["exe"], "name": os.path.basename(p["exe"])} for p in process_inventory()
+            if p["exe"] and p["username"] == username and p["session"] == session]
 
 
 def visible_apps():
@@ -130,7 +125,7 @@ def visible_apps():
                         return True
                 except PROCESS_GONE:
                     return True
-                except psutil.AccessDenied:
+                except (psutil.Error, OSError):
                     log.warning("cannot capture context pid=%s; leaving application untouched", pid)
                     return True
                 apps[pid] = {"pid": pid, "birth": proc.info["create_time"], "exe": proc.info["exe"],
@@ -138,7 +133,9 @@ def visible_apps():
                              "session": session, "cmdline": cmdline, "cwd": cwd, "hwnds": []}
             apps[pid]["hwnds"].append(hwnd)
         except win32gui.error:
-            return True
+            pass
+        finally:
+            win32api.SetLastError(0)
         return True
 
     win32api.SetLastError(0)
@@ -246,131 +243,72 @@ def close_apps(target_apps, cfg, progress=None, cancel=None):
     return result
 
 
-def _suspend_process_tree(pid):
-    """Suspend all threads in the process and its children, and flush working sets."""
-    pids = [pid]
-    try:
-        proc = psutil.Process(pid)
-        for child in proc.children(recursive=True):
-            pids.append(child.pid)
-    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
-        pass
-
-    success_pids = []
-    for p in pids:
-        try:
-            h = _kernel32.OpenProcess(PROCESS_SUSPEND_QUOTA, False, p) or _kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, p)
-            if h:
-                try:
-                    if _ntdll.NtSuspendProcess(h) == 0:
-                        _psapi.EmptyWorkingSet(h)
-                        success_pids.append(p)
-                finally:
-                    _kernel32.CloseHandle(h)
-        except Exception as e:
-            log.warning("failed to suspend pid=%s: %s", p, e)
-    return pids, success_pids
+class UnsafeSuspendError(ScanError):
+    pass
 
 
-def _resume_process_tree(pids):
-    """Resume all threads in the process tree."""
-    for p in dict.fromkeys(pids):
-        try:
-            h = _kernel32.OpenProcess(PROCESS_RESUME, False, p) or _kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, p)
-            if h:
-                try:
-                    _ntdll.NtResumeProcess(h)
-                finally:
-                    _kernel32.CloseHandle(h)
-        except Exception as e:
-            log.warning("failed to resume pid=%s: %s", p, e)
+def suspend_apps(target_apps, cfg=None, cancel=None, confirm=None, healthy=None, recovered=None):
+    import suspension
+    return suspension.suspend_apps(target_apps, cfg, cancel, confirm, healthy, recovered)
 
 
-def _hide_windows(hwnds):
-    for hwnd in hwnds:
-        try:
-            if win32gui.IsWindow(hwnd):
-                _user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
-        except Exception as e:
-            log.debug("failed to hide hwnd=%s: %s", hwnd, e)
+def _current_boot_suspensions(apps):
+    """Old PID-only journals cannot safely identify suspended descendants.
 
-
-def _show_windows(hwnds):
-    for hwnd in hwnds:
-        try:
-            if win32gui.IsWindow(hwnd):
-                _user32.ShowWindowAsync(hwnd, win32con.SW_SHOW)
-        except Exception as e:
-            log.debug("failed to show hwnd=%s: %s", hwnd, e)
-
-
-def suspend_apps(target_apps, cancel=None):
-    """Deep freeze target apps: hide windows, suspend process trees, and flush working sets to SSD."""
-    apps = storage.validate_apps(target_apps, "挂起目标")
-    username, session, protected = _scope()
-    for app in apps:
-        if not all(field in app for field in ("pid", "birth", "username", "session")):
-            raise ScanError("挂起目标缺少进程身份，请重新扫描")
-        if (app["pid"] in protected or app["username"].lower() != username or app["session"] != session
-                or os.path.basename(app["exe"]).lower() in SYSTEM_EXES):
-            raise ScanError("挂起目标包含受保护进程，已停止操作")
-
-    # 1. Hide windows to prevent Ghost Window / "Not Responding" dialogs
-    for app in apps:
-        if cancel and cancel.is_set():
-            break
-        _hide_windows(app.get("hwnds", []))
-
-    time.sleep(0.05)  # brief pause for DWM to composite and unmap frames
-
-    # 2. Suspend process trees and empty working sets
-    result = {"suspended": [], "failed": []}
-    for app in apps:
-        if cancel and cancel.is_set():
-            _show_windows(app.get("hwnds", []))
-            result["failed"].append(app)
-            continue
-        if _matches(app) is not True:
-            _show_windows(app.get("hwnds", []))
-            result["failed"].append(app)
-            continue
-        all_pids, suspended_pids = _suspend_process_tree(app["pid"])
-        if suspended_pids:
-            app["tree_pids"] = suspended_pids
-            app["action"] = "suspend"
-            app["status"] = "suspended"
-            result["suspended"].append(app)
-            log.info("suspended app id=%s name=%s tree_pids=%s", app["id"], app["name"], suspended_pids)
-        else:
-            _show_windows(app.get("hwnds", []))
-            result["failed"].append(app)
-            log.warning("failed to suspend app id=%s name=%s", app["id"], app["name"])
-
-    return result
+    Only a full Windows boot proves that every process in an old tree is gone.
+    Never resume or terminate a bare PID, including when a root has exited.
+    """
+    suspensions = [app for app in apps if app.get("action") == "suspend" and not app.get("suspend_id")]
+    if not suspensions:
+        return []
+    boot = psutil.boot_time()
+    return [app for app in suspensions
+            if not all(field in app for field in ("pid", "birth", "username", "session"))
+            or app["birth"] >= boot or _matches(app) is not False]
 
 
 def discard_apps(pending_apps):
-    """Clean up pending apps: terminate any suspended processes so they don't linger."""
-    for app in pending_apps:
-        if app.get("action") == "suspend":
-            if _matches(app) is True:
-                pids = app.get("tree_pids") or [app.get("pid")]
-                for pid in reversed(list(dict.fromkeys(pids))):
-                    if pid and psutil.pid_exists(pid):
-                        try:
-                            p = psutil.Process(pid)
-                            p.terminate()
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            pass
+    import suspension
+    suspension.resume_records(pending_apps)
+    if _current_boot_suspensions(pending_apps):
+        raise UnsafeSuspendError("旧版当前会话的挂起记录不能安全清空。请重启 Windows 后再恢复或放弃记录。")
+    # Discarding launch records must never terminate applications.
 
 
 def resume_all_suspended(pending_apps):
-    """Safely resume all suspended processes (e.g. on GameSwitcher exit)."""
-    for app in pending_apps:
-        if app.get("action") == "suspend":
-            if _matches(app) is True:
-                _resume_process_tree(app.get("tree_pids", [app["pid"]]))
-                _show_windows(app.get("hwnds", []))
+    """Compatibility guard: never blindly resume legacy PID-only process trees."""
+    import suspension
+    suspension.resume_records(pending_apps)
+    if _current_boot_suspensions(pending_apps):
+        raise UnsafeSuspendError("旧版挂起记录缺少子进程身份，无法安全自动解冻。请重启 Windows 后恢复应用。")
+
+
+def prepare_legacy_relaunch_after_restart():
+    """Explicit user-confirmed recovery for Fast Startup / uncertain boot times.
+
+    Original processes must be gone. Preserve the journal before converting
+    launch records; never operate on the recorded child PIDs.
+    """
+    state = storage.load_state()
+    pending = state["apps"]
+    changed = False
+    for app in pending:
+        if app.get("action") != "suspend" or app.get("suspend_id"):
+            continue
+        if not all(field in app for field in ("pid", "birth", "username", "session")):
+            raise UnsafeSuspendError("旧记录缺少原进程身份，无法确认已经重启。记录已保留，请手动检查。")
+        if _matches(app) is not False:
+            raise UnsafeSuspendError("原挂起进程仍存在或无法确认身份。请先使用 Windows 的「重启」，记录已保留。")
+        app["action"], app["status"] = "close", "closed"
+        app.pop("tree_pids", None)
+        changed = True
+    if changed:
+        # Backup exactly what is on disk, before changing any launch records.
+        import uuid
+        backup = f"pending_restore.before-restart-{uuid.uuid4().hex}.json"
+        storage._save(backup, storage._load(storage.PENDING_RESTORE_FILE, None))
+        storage.save_pending_restore(pending, "partial" if pending else "ready", action="close")
+    return changed
 
 
 def _signature(app):
@@ -431,11 +369,41 @@ def launch_app(app, timeout=8, cancel=None):
 
 def restore_apps(progress=None, cancel=None):
     cfg = storage.load_config()
-    state = storage.load_state()
-    pending = state["apps"]
-    default_action = state.get("action", "suspend")
-    result = {"restored": [], "already_running": [], "missing": []}
-    current = visible_apps()
+    pending = storage.load_pending_restore()
+    import suspension
+    resumed, failed_operations = [], set()
+    for operation_id in {a["suspend_id"] for a in pending if a.get("suspend_id")}:
+        group = [a for a in pending if a.get("suspend_id") == operation_id]
+        try:
+            suspension.resume_records(group)
+            for app in group:
+                matching = _matches(app)
+                if matching is True:
+                    try:
+                        if psutil.Process(app["pid"]).status() == psutil.STATUS_STOPPED:
+                            failed_operations.add(app["id"])
+                        else:
+                            resumed.append(app)
+                    except psutil.Error:
+                        failed_operations.add(app["id"])
+                elif matching is False:
+                    app["action"], app["status"] = "close", "closed"
+                    app.pop("suspend_id", None)
+                else:
+                    failed_operations.add(app["id"])
+        except Exception:
+            log.exception("guardian restoration not confirmed; records retained")
+            failed_operations.update(a["id"] for a in group)
+    resumed_ids = {a["id"] for a in resumed}
+    pending = [a for a in pending if a["id"] not in resumed_ids]
+    blocked_ids = {a["id"] for a in _current_boot_suspensions(pending)}
+    for app in pending:
+        if app.get("action") == "suspend" and app["id"] not in blocked_ids:
+            # A previous Windows boot has ended; resume cannot recover its memory.
+            app["action"], app["status"] = "close", "closed"
+            app.pop("tree_pids", None)
+    result = {"restored": resumed, "already_running": [], "missing": [], "blocked_suspend": []}
+    current = visible_apps() if len(blocked_ids) < len(pending) else []
     consumed = set()
     storage.save_pending_restore(pending, "restoring")
     remaining = list(pending)
@@ -445,50 +413,39 @@ def restore_apps(progress=None, cancel=None):
                 break
             if progress:
                 progress(f"恢复 {app['name']} ({index + 1}/{len(pending)})")
-            action = app.get("action") or default_action
-            if action == "suspend":
-                alive = _matches(app)
-                if alive is True:
-                    _resume_process_tree(app.get("tree_pids", [app["pid"]]))
-                    _show_windows(app.get("hwnds", []))
-                    consumed.add(app["id"])
-                    result["restored"].append(app)
-                    log.info("resumed suspended app id=%s name=%s", app["id"], app["name"])
-                else:
-                    log.info("suspended app no longer alive, falling back to launch id=%s", app["id"])
-                    app["restore_attempted"] = True
-                    storage.save_pending_restore(remaining, "restoring")
-                    if launch_app(app, cfg["restore_timeout_sec"], cancel):
-                        result["restored"].append(app)
-                    else:
-                        result["missing"].append(app)
-                        continue
+            if app["id"] in failed_operations:
+                result["missing"].append(app)
+                continue
+            if app["id"] in blocked_ids:
+                result["missing"].append(app)
+                result["blocked_suspend"].append(app)
+                log.warning("unsafe legacy suspension retained id=%s; Windows restart required", app["id"])
+                continue
+            original = next((a for a in current if a["id"] not in consumed
+                             and a["pid"] == app.get("pid") and a["birth"] == app.get("birth")
+                             and path_key(a["exe"]) == path_key(app["exe"])
+                             and set(app.get("hwnds", [])) & set(a["hwnds"])), None)
+            match = original or next((a for a in current if a["id"] not in consumed and _signature(a) == _signature(app)
+                                      and ("birth" not in app or a["birth"] >= app["birth"])), None)
+            partial = (match is not None and app.get("birth") == match["birth"] and app.get("hwnds")
+                       and set(app["hwnds"]) & set(match["hwnds"])
+                       and not set(app["hwnds"]).issubset(match["hwnds"]))
+            if match and not partial:
+                consumed.add(match["id"])
+                result["already_running"].append(app)
             else:
-                original = next((a for a in current if a["id"] not in consumed
-                                 and a["pid"] == app.get("pid") and a["birth"] == app.get("birth")
-                                 and path_key(a["exe"]) == path_key(app["exe"])
-                                 and set(app.get("hwnds", [])) & set(a["hwnds"])), None)
-                match = original or next((a for a in current if a["id"] not in consumed and _signature(a) == _signature(app)
-                                          and ("birth" not in app or a["birth"] >= app["birth"])), None)
-                partial = (match is not None and app.get("birth") == match["birth"] and app.get("hwnds")
-                           and set(app["hwnds"]) & set(match["hwnds"])
-                           and not set(app["hwnds"]).issubset(match["hwnds"]))
-                if match and not partial:
-                    consumed.add(match["id"])
-                    result["already_running"].append(app)
+                if partial or app.get("restore_attempted"):
+                    result["missing"].append(app)
+                    continue
+                # Persist BEFORE launch. If a launch is uncertain or this process
+                # crashes, another Restore click cannot silently create duplicates.
+                app["restore_attempted"] = True
+                storage.save_pending_restore(remaining, "restoring")
+                if launch_app(app, cfg["restore_timeout_sec"], cancel):
+                    result["restored"].append(app)
                 else:
-                    if partial or app.get("restore_attempted"):
-                        result["missing"].append(app)
-                        continue
-                    # Persist BEFORE launch. If a launch is uncertain or this process
-                    # crashes, another Restore click cannot silently create duplicates.
-                    app["restore_attempted"] = True
-                    storage.save_pending_restore(remaining, "restoring")
-                    if launch_app(app, cfg["restore_timeout_sec"], cancel):
-                        result["restored"].append(app)
-                    else:
-                        result["missing"].append(app)
-                        continue
+                    result["missing"].append(app)
+                    continue
             remaining = [entry for entry in remaining if entry["id"] != app["id"]]
             storage.save_pending_restore(remaining, "restoring")
     finally:

@@ -33,6 +33,7 @@ with ExitStack() as stack:
     main.icon = tray
 
     def setup(icon):
+        import winprocess
         def update():
             main.update_tray_state()
             result["dispatch_on_ui_thread"] = threading.get_ident() == main_thread
@@ -40,6 +41,7 @@ with ExitStack() as stack:
         icon.dispatch(update)
         if not done.wait(5):
             result["error"] = "native dispatch timed out"
+        result["ui_health_probe"] = winprocess.ui_responding(icon._hwnd)
         icon.stop()
 
     def watchdog():
@@ -55,5 +57,6 @@ with ExitStack() as stack:
     main.icon = None
     result["state_after_restart"] = storage.load_state()["mode"]
     print(json.dumps(result, ensure_ascii=False), flush=True)
-    if not result["dispatch_on_ui_thread"] or result["state_after_restart"] != "game":
+    if (not result["dispatch_on_ui_thread"] or not result.get("ui_health_probe")
+            or result["state_after_restart"] != "game"):
         raise SystemExit(1)
