@@ -18,6 +18,24 @@ WAIT_OBJECT_0, WAIT_TIMEOUT = 0, 258
 SYNCHRONIZE, MODIFY_EVENT = 0x100000, 0x0002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_SUSPEND_RESUME = 0x0800
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+STATUS_PROCESS_IS_TERMINATING = 0xC000010A
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", DWORD),
+        ("cntUsage", DWORD),
+        ("th32ProcessID", DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", DWORD),
+        ("cntThreads", DWORD),
+        ("th32ParentProcessID", DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
 
 
 def bind(library, name, args, result):
@@ -31,6 +49,10 @@ _close = bind(kernel, "CloseHandle", [HANDLE], BOOL)
 _wait = bind(kernel, "WaitForSingleObject", [HANDLE, DWORD], DWORD)
 _times = bind(kernel, "GetProcessTimes", [HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4, BOOL)
 _image = bind(kernel, "QueryFullProcessImageNameW", [HANDLE, DWORD, wintypes.LPWSTR, ctypes.POINTER(DWORD)], BOOL)
+_session = bind(kernel, "ProcessIdToSessionId", [DWORD, ctypes.POINTER(DWORD)], BOOL)
+_snap = bind(kernel, "CreateToolhelp32Snapshot", [DWORD, DWORD], HANDLE)
+_first = bind(kernel, "Process32FirstW", [HANDLE, ctypes.POINTER(PROCESSENTRY32W)], BOOL)
+_next = bind(kernel, "Process32NextW", [HANDLE, ctypes.POINTER(PROCESSENTRY32W)], BOOL)
 _suspend = bind(ntdll, "NtSuspendProcess", [HANDLE], ctypes.c_long)
 _resume = bind(ntdll, "NtResumeProcess", [HANDLE], ctypes.c_long)
 _create_event = bind(kernel, "CreateEventW", [ctypes.c_void_p, BOOL, BOOL, wintypes.LPCWSTR], HANDLE)
@@ -75,7 +97,7 @@ def open_identity(identity, suspend_access=True):
         if not _times(handle, *(ctypes.byref(value) for value in times)):
             raise ctypes.WinError(ctypes.get_last_error())
         ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
-        birth = (ticks - 116444736000000000) / 10000000
+        birth = float(ticks - 116444736000000000) / 10000000.0
         path, size = ctypes.create_unicode_buffer(32768), DWORD(32768)
         if not _image(handle, 0, path, ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -98,7 +120,45 @@ def resume(handle):
         return
     status = _resume(handle)
     if status < 0:
+        if (status & 0xffffffff) == STATUS_PROCESS_IS_TERMINATING or signaled(handle):
+            return
         raise OSError(f"NtResumeProcess failed: 0x{status & 0xffffffff:08x}")
+
+
+def snapshot_meta():
+    """Fast Win32 snapshot returning {pid: (ppid, exe, birth, session)} for all processes."""
+    snapshot = _snap(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    result = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        buf = ctypes.create_unicode_buffer(32768)
+        ok = _first(snapshot, ctypes.byref(entry))
+        while ok:
+            pid = int(entry.th32ProcessID)
+            ppid = int(entry.th32ParentProcessID)
+            sid = DWORD(0)
+            session = int(sid.value) if _session(pid, ctypes.byref(sid)) else -1
+            exe, birth = "", None
+            handle = _open(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                try:
+                    size = DWORD(32768)
+                    if _image(handle, 0, buf, ctypes.byref(size)):
+                        exe = buf.value
+                    times = [wintypes.FILETIME() for _ in range(4)]
+                    if _times(handle, *(ctypes.byref(value) for value in times)):
+                        ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                        birth = float(ticks - 116444736000000000) / 10000000.0
+                finally:
+                    close(handle)
+            result[pid] = (ppid, exe, birth, session)
+            ok = _next(snapshot, ctypes.byref(entry))
+    finally:
+        close(snapshot)
+    return result
 
 
 EVENT_NAMES = ("ready", "confirm", "confirmed", "heartbeat", "resume", "done")

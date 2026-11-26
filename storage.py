@@ -172,8 +172,12 @@ def load_baseline():
 
 def full_baseline_available():
     raw = _load(BASELINE_FILE, [])
-    apps = load_baseline()
-    return isinstance(raw, dict) and raw.get("kind") == "user-session-processes" and bool(apps)
+    if not isinstance(raw, dict):
+        validate_apps(raw, BASELINE_FILE)
+        return False
+    if raw.get("version") != 2 or raw.get("kind") != "user-session-processes":
+        raise StorageError("baseline.json 含无效基线类型")
+    return bool(validate_apps(raw.get("apps"), BASELINE_FILE))
 
 
 def load_state():

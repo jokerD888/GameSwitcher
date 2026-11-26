@@ -38,7 +38,8 @@ _session_lock = threading.RLock()
 
 
 def identity_key(node):
-    return node["pid"], node["birth"], core.path_key(node["exe"])
+    birth = node.get("birth")
+    return node["pid"], round(birth, 4) if birth is not None else None, core.path_key(node["exe"])
 
 
 def _windows_path(exe):
@@ -49,14 +50,39 @@ def _windows_path(exe):
         return False
 
 
+def _shared_root_directories():
+    home = os.path.expanduser("~")
+    candidates = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("ProgramData", r"C:\ProgramData"),
+        os.environ.get("TEMP", ""),
+        os.environ.get("TMP", ""),
+        os.path.dirname(home),
+        home,
+        os.path.join(home, "Desktop"),
+        os.path.join(home, "Downloads"),
+        os.path.join(home, "Documents"),
+    ]
+    return {core.path_key(path) for path in candidates if path}
+
+
+def _is_dedicated_app_dir(directory):
+    key = core.path_key(directory)
+    if os.path.dirname(key) == key or _windows_path(key):
+        return False
+    return key not in _shared_root_directories()
+
+
 def build_plan(target_apps, inventory, baseline, cfg, scope=None, enforce_limit=True):
     """Pure plan builder. No process/window state is changed."""
     roots = storage.validate_apps(target_apps, "挂起候选")
     cfg = storage.validate_config(cfg)
     user, session, protected = scope or core._scope()
     baseline_paths = {core.path_key(a["exe"]) for a in baseline}
-    critical_directories = {os.path.dirname(core.path_key(p["exe"])) for p in [*inventory, *baseline]
-                            if p.get("exe") and os.path.basename(p["exe"]).lower() in CRITICAL_EXES}
+    critical_directories = {d for d in (os.path.dirname(core.path_key(p["exe"])) for p in [*inventory, *baseline]
+                                        if p.get("exe") and os.path.basename(p["exe"]).lower() in CRITICAL_EXES)
+                            if _is_dedicated_app_dir(d)}
     records = {p["pid"]: p for p in inventory}
     children = {}
     for node in inventory:
@@ -113,9 +139,11 @@ def build_plan(target_apps, inventory, baseline, cfg, scope=None, enforce_limit=
                     and node["birth"] > previous["birth"]):
                 break
             name = os.path.basename(node.get("exe") or "").lower()
-            # Shells launch unrelated applications; a baseline browser/IDE's helpers
-            # remain part of that protected application's dependency family.
-            if name not in LAUNCHERS and node.get("exe"):
+            # Shells/launchers start unrelated applications; CRITICAL_EXES trees
+            # are already protected via critical_family across launcher hops.
+            if name in LAUNCHERS:
+                break
+            if node.get("exe"):
                 why = ("远控/输入依赖" if name in CRITICAL_EXES else
                        "完整进程基线" if core.path_key(node["exe"]) in baseline_paths else
                        "排除名单" if core.is_excluded(node, cfg["exclude_list"]) else None)
@@ -129,7 +157,13 @@ def build_plan(target_apps, inventory, baseline, cfg, scope=None, enforce_limit=
         seen, pid = set(), app["pid"]
         while pid in records and pid not in seen:
             seen.add(pid)
-            pid = records[pid].get("ppid", 0)
+            current = records[pid]
+            parent_pid = current.get("ppid", 0)
+            parent = records.get(parent_pid)
+            if (parent and current.get("birth") is not None and parent.get("birth") is not None
+                    and current["birth"] < parent["birth"]):
+                break
+            pid = parent_pid
         return len(seen)
 
     selected, blocked, skipped = {}, set(), []
@@ -173,8 +207,12 @@ def build_plan(target_apps, inventory, baseline, cfg, scope=None, enforce_limit=
 def preview(target_apps, cfg=None, enforce_limit=True):
     if not storage.full_baseline_available():
         raise storage.StorageError("模式 B 需要重新捕获完整进程基线，旧可见窗口基线或空基线不能用于挂起")
-    return build_plan(target_apps, core.process_inventory(), storage.load_baseline(),
-                      cfg or storage.load_config(), enforce_limit=enforce_limit)
+    roots = storage.validate_apps(target_apps, "挂起候选")
+    cfg = storage.validate_config(cfg or storage.load_config())
+    if not roots:
+        return {"apps": [], "nodes": [], "skipped": []}
+    return build_plan(roots, core.process_inventory(), storage.load_baseline(),
+                      cfg, enforce_limit=enforce_limit)
 
 
 def _name(operation_id):
@@ -272,12 +310,18 @@ def guardian_main(operation_id):
         parent_handle = native.open_identity(parent, suspend_access=False)
         if native.signaled(parent_handle):
             raise core.ScanError("主程序已退出")
+        if events.poll("resume"):
+            raise core.ScanError("挂起已取消")
         fresh = preview(data["apps"], data["config"])
+        if events.poll("resume") or native.signaled(parent_handle):
+            raise core.ScanError("挂起已取消")
         if {identity_key(n) for n in fresh["nodes"]} != {identity_key(n) for n in data["nodes"]}:
             raise core.ScanError("挂起前进程树或保护规则发生变化，未执行挂起")
         native.register_rescue_hotkey()
         registered = True
         for node in data["nodes"]:
+            if events.poll("resume") or native.signaled(parent_handle):
+                raise core.ScanError("挂起已取消")
             if core._matches(node) is not True:
                 raise core.ScanError("挂起前进程身份无法确认")
             proc = psutil.Process(node["pid"])
@@ -346,7 +390,7 @@ def guardian_main(operation_id):
             _write(data)
         except Exception:
             log.exception("could not save rollback intent")
-        errors = []
+        errors, failed_pids = [], set()
         for node in reversed(data["nodes"]):
             pid = node["pid"]
             if pid in frozen:
@@ -355,12 +399,25 @@ def guardian_main(operation_id):
                     node["phase"] = "resumed"
                 except Exception as exc:
                     node["phase"] = "resume_failed"
+                    failed_pids.add(pid)
                     errors.append(str(exc))
             elif node.get("phase") == "attempting":
                 # A failed native call is not proof that no thread changed state.
+                failed_pids.add(pid)
                 errors.append("挂起调用结果不确定，保留身份记录以供核对")
-        live = {pid for pid, handle in handles.items() if not native.signaled(handle)}
-        _restore_windows(data.get("windows", []), live)
+        live = set()
+        for pid, handle in handles.items():
+            if pid in failed_pids:
+                continue
+            try:
+                if not native.signaled(handle):
+                    live.add(pid)
+            except Exception:
+                log.warning("could not check liveness for pid=%s", pid, exc_info=True)
+        try:
+            _restore_windows(data.get("windows", []), live)
+        except Exception:
+            log.exception("window restoration failed during guardian recovery")
         data["phase"] = "recovery_failed" if errors else "resumed"
         data["errors"] = errors
         try:
@@ -438,17 +495,30 @@ class Client:
     def _monitor(self):
         while not self.stop_event.wait(0.5):
             try:
-                if self.events.poll("done") or self.child.poll() is not None:
-                    if self.child.poll() is not None and not self.events.poll("done"):
+                done = self.events.poll("done")
+                exited = self.child.poll() is not None
+            except Exception:
+                log.exception("guardian event monitor failed; stopping monitor")
+                return
+            if done or exited:
+                if exited and not done:
+                    try:
                         _recover_saved(self.id)
-                    if self.recovered:
+                    except Exception:
+                        log.exception("fallback recovery after guardian exit failed")
+                if self.recovered:
+                    try:
                         self.recovered(self.id)
-                    return
+                    except Exception:
+                        log.exception("recovered callback failed")
+                return
+            try:
                 if self.healthy():
                     self.events.set("heartbeat")
             except Exception:
-                log.exception("guardian heartbeat failed; watchdog will resume applications")
-                return
+                # Skip heartbeat on probe failure so watchdog recovers, but keep
+                # monitoring for 'done' so tray state reconciles cleanly.
+                log.exception("guardian heartbeat probe failed; waiting for watchdog recovery")
 
     def resume(self):
         self.stop_event.set()
@@ -668,6 +738,10 @@ def _prune_completed_operations(active_ids):
                 os.remove(log_file)
         except Exception:
             log.debug("skip pruning guardian operation=%s", operation_id, exc_info=True)
+
+
+def prune_completed_operations(active_ids):
+    _prune_completed_operations(active_ids)
 
 
 def reconcile_completed():

@@ -119,12 +119,19 @@ def _data_location():
     return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), storage.APP_DIR_NAME)
 
 
+def _clip_notify_text(text, limit):
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
 def notify(msg, title="GameSwitcher", warn=False, timeout=3):
     if warn:
         _msg_box(msg, title, MB_ICONWARN)
         return
     if not icon or _shutdown.is_set():
         return
+    safe_msg = _clip_notify_text(msg, 240)
+    safe_title = _clip_notify_text(title, 60)
 
     def show():
         global _notify_timer, _notify_generation
@@ -132,7 +139,7 @@ def notify(msg, title="GameSwitcher", warn=False, timeout=3):
         generation = _notify_generation
         if _notify_timer:
             _notify_timer.cancel()
-        icon.notify(msg, title)
+        icon.notify(safe_msg, safe_title)
         if timeout > 0:
             def dismiss():
                 def remove():
@@ -224,13 +231,13 @@ def already_running(mutex_name=r"Local\GameSwitcher_SingleInstance"):
     _instance_file = stream
     # Keep the old session mutex as well, so an already running v1 cannot race
     # the migrated snapshot writer in the same desktop session.
-    kernel = ctypes.windll.kernel32
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
     kernel.CreateMutexW.restype = ctypes.c_void_p
     kernel.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel.CloseHandle.restype = ctypes.c_int
     _compat_mutex = kernel.CreateMutexW(None, False, mutex_name)
-    error = kernel.GetLastError()
+    error = ctypes.get_last_error()
     if not _compat_mutex:
         _release_instance()
         raise OSError("无法创建单实例互斥")
@@ -446,7 +453,7 @@ def do_retry_restore(*_):
 @threaded
 def do_discard_restore(*_):
     state = storage.load_state()
-    if state["apps"] and _msg_box(f"确定清空 {len(state['apps'])} 条恢复记录？\n不会结束任何程序；当前 Windows 会话的旧挂起记录不会被丢弃。",
+    if state["apps"] and _msg_box(f"确定清空 {len(state['apps'])} 条恢复记录？\n当前挂起中的应用会先恢复运行，不会结束任何程序；当前 Windows 会话的旧挂起记录不会被丢弃。",
                                   flags=MB_YESNO | MB_ICONWARN) != IDYES:
         return
     if not _shutdown.is_set():
@@ -519,7 +526,10 @@ def autostart_enabled():
 def toggle_autostart(*_):
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
         if autostart_enabled():
-            winreg.DeleteValue(key, VAL_NAME)
+            try:
+                winreg.DeleteValue(key, VAL_NAME)
+            except FileNotFoundError:
+                pass
         else:
             winreg.SetValueEx(key, VAL_NAME, 0, winreg.REG_SZ, _autostart_command())
 
@@ -586,7 +596,7 @@ def build_menu():
                          enabled=enabled and not in_game and _cache.get("full_baseline", False)),
         pystray.MenuItem("模式 A：正常关闭并保存记录", do_enter_close_mode,
                          enabled=enabled and not in_game),
-        pystray.MenuItem(f"✨ 恢复应用（{len(state['apps'])} 个已保存 · {action_label}）" if in_game else "✨ 恢复应用（无挂起记录）",
+        pystray.MenuItem(f"✨ 恢复应用（{len(state['apps'])} 个已保存 · {action_label}）" if in_game else "✨ 恢复应用（无待恢复记录）",
                          do_restore, enabled=enabled and in_game),
         pystray.MenuItem("确认已重启：恢复旧启动记录", do_recover_after_restart,
                          enabled=enabled and legacy),

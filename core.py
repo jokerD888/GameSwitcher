@@ -59,19 +59,50 @@ def _scope():
         raise ScanError("无法确定当前用户、会话或祖先进程，已停止扫描") from exc
 
 
+def _native_process_meta():
+    import winprocess
+    return winprocess.snapshot_meta()
+
+
 def process_inventory():
     """Snapshot identities/parentage without reading command lines or requiring windows."""
+    _, own_session, _ = _scope()
+    try:
+        native = _native_process_meta()
+    except OSError:
+        native = {}
     result = []
     try:
-        for proc in psutil.process_iter(["pid", "ppid", "exe", "username", "create_time"]):
-            info = proc.info
-            try:
-                session = _session_id(proc.pid)
-            except (OSError, psutil.Error):
-                session = -1
-            result.append({"pid": proc.pid, "ppid": info.get("ppid", 0),
-                           "exe": info.get("exe") or "", "birth": info.get("create_time"),
-                           "username": (info.get("username") or "").lower(), "session": session})
+        for proc in psutil.process_iter():
+            pid = proc.pid
+            meta = native.get(pid)
+            if meta is not None:
+                ppid, exe, birth, session = meta
+                username = ""
+                if session == own_session and exe:
+                    try:
+                        username = (proc.username() or "").lower()
+                    except psutil.Error:
+                        username = ""
+            else:
+                info = getattr(proc, "info", None) or {}
+                try:
+                    session = _session_id(pid)
+                except (OSError, psutil.Error):
+                    session = -1
+                ppid = info.get("ppid", 0)
+                exe = info.get("exe") or ""
+                birth = info.get("create_time")
+                username = (info.get("username") or "").lower()
+                if not info and session == own_session:
+                    try:
+                        exe = proc.exe() or ""
+                        birth = proc.create_time()
+                        username = (proc.username() or "").lower()
+                    except (OSError, psutil.Error):
+                        pass
+            result.append({"pid": pid, "ppid": ppid, "exe": exe, "birth": birth,
+                           "username": username, "session": session})
     except psutil.Error as exc:
         raise ScanError("完整进程扫描失败，未修改基线") from exc
     return result
@@ -89,20 +120,24 @@ def visible_apps():
     username, session, protected = _scope()
     by_pid = {}
     try:
-        for proc in psutil.process_iter(["pid", "exe", "username", "create_time"]):
-            info = proc.info
-            exe = info.get("exe")
-            if (proc.pid in protected or not exe or not info.get("username")
-                    or info["username"].lower() != username or info.get("create_time") is None):
+        for proc in psutil.process_iter():
+            pid = proc.pid
+            if pid in protected:
+                continue
+            try:
+                if _session_id(pid) != session:
+                    continue
+                exe = proc.exe()
+                proc_user = proc.username()
+                birth = proc.create_time()
+            except (OSError, psutil.Error):
+                continue
+            if not exe or not proc_user or proc_user.lower() != username or birth is None:
                 continue
             name = os.path.basename(exe).lower()
             if name in SYSTEM_EXES or name.endswith(".tmp"):
                 continue
-            try:
-                if _session_id(proc.pid) == session:
-                    by_pid[proc.pid] = proc
-            except (OSError, psutil.Error):
-                log.debug("inaccessible session pid=%s", proc.pid)
+            by_pid[pid] = (proc, exe, birth)
     except psutil.Error as exc:
         raise ScanError("进程扫描失败") from exc
 
@@ -114,22 +149,23 @@ def visible_apps():
                 return True
             title = win32gui.GetWindowText(hwnd)
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            proc = by_pid.get(pid)
-            if not title or proc is None:
+            entry = by_pid.get(pid)
+            if not title or entry is None:
                 return True
+            proc, exe, birth = entry
             if pid not in apps:
                 try:
                     cmdline, cwd = proc.cmdline() or [], proc.cwd() or ""
                     current = psutil.Process(pid)
-                    if current.create_time() != proc.info["create_time"] or path_key(current.exe()) != path_key(proc.info["exe"]):
+                    if abs(current.create_time() - birth) > 0.001 or path_key(current.exe()) != path_key(exe):
                         return True
                 except PROCESS_GONE:
                     return True
                 except (psutil.Error, OSError):
                     log.warning("cannot capture context pid=%s; leaving application untouched", pid)
                     return True
-                apps[pid] = {"pid": pid, "birth": proc.info["create_time"], "exe": proc.info["exe"],
-                             "name": os.path.basename(proc.info["exe"]), "username": username,
+                apps[pid] = {"pid": pid, "birth": birth, "exe": exe,
+                             "name": os.path.basename(exe), "username": username,
                              "session": session, "cmdline": cmdline, "cwd": cwd, "hwnds": []}
             apps[pid]["hwnds"].append(hwnd)
         except win32gui.error:
@@ -398,12 +434,13 @@ def restore_apps(progress=None, cancel=None):
     pending = [a for a in pending if a["id"] not in resumed_ids]
     blocked_ids = {a["id"] for a in _current_boot_suspensions(pending)}
     for app in pending:
-        if app.get("action") == "suspend" and app["id"] not in blocked_ids:
+        if (app.get("action") == "suspend" and not app.get("suspend_id")
+                and app["id"] not in blocked_ids and app["id"] not in failed_operations):
             # A previous Windows boot has ended; resume cannot recover its memory.
             app["action"], app["status"] = "close", "closed"
             app.pop("tree_pids", None)
     result = {"restored": resumed, "already_running": [], "missing": [], "blocked_suspend": []}
-    current = visible_apps() if len(blocked_ids) < len(pending) else []
+    current = visible_apps() if len(blocked_ids | failed_operations) < len(pending) else []
     consumed = set()
     storage.save_pending_restore(pending, "restoring")
     remaining = list(pending)
@@ -422,12 +459,14 @@ def restore_apps(progress=None, cancel=None):
                 log.warning("unsafe legacy suspension retained id=%s; Windows restart required", app["id"])
                 continue
             original = next((a for a in current if a["id"] not in consumed
-                             and a["pid"] == app.get("pid") and a["birth"] == app.get("birth")
+                             and a["pid"] == app.get("pid")
+                             and "birth" in app and abs(a["birth"] - app["birth"]) < 0.001
                              and path_key(a["exe"]) == path_key(app["exe"])
                              and set(app.get("hwnds", [])) & set(a["hwnds"])), None)
             match = original or next((a for a in current if a["id"] not in consumed and _signature(a) == _signature(app)
-                                      and ("birth" not in app or a["birth"] >= app["birth"])), None)
-            partial = (match is not None and app.get("birth") == match["birth"] and app.get("hwnds")
+                                      and ("birth" not in app or a["birth"] >= app["birth"] - 0.001)), None)
+            partial = (match is not None and "birth" in app and abs(app["birth"] - match["birth"]) < 0.001
+                       and app.get("hwnds")
                        and set(app["hwnds"]) & set(match["hwnds"])
                        and not set(app["hwnds"]).issubset(match["hwnds"]))
             if match and not partial:
@@ -450,4 +489,9 @@ def restore_apps(progress=None, cancel=None):
             storage.save_pending_restore(remaining, "restoring")
     finally:
         storage.save_pending_restore(remaining, "partial" if remaining else "ready")
+        if resumed:
+            try:
+                suspension.prune_completed_operations({a["suspend_id"] for a in remaining if a.get("suspend_id")})
+            except Exception:
+                log.debug("guardian history pruning failed after restore", exc_info=True)
     return result

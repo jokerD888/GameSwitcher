@@ -112,6 +112,7 @@ class SafetyTests(unittest.TestCase):
         self.stack.enter_context(patch.object(core.time, "monotonic", side_effect=lambda: next(ticks)))
         self.stack.enter_context(patch.object(core, "_scope", return_value=("user", 1, {0, 4, core.SELF_PID, 2000})))
         self.stack.enter_context(patch.object(core, "_session_id", return_value=1))
+        self.stack.enter_context(patch.object(core, "_native_process_meta", return_value={}))
         self.stack.enter_context(patch.object(main, "notify"))
         self.stack.enter_context(patch.object(main, "_msg_box", return_value=main.IDYES))
         self.stack.enter_context(patch.object(main, "_request_update"))
@@ -548,13 +549,18 @@ class SafetyTests(unittest.TestCase):
     def test_guardian_restore_failure_keeps_all_references(self):
         import suspension
         entry = dict(self.target, action="suspend", status="suspended", suspend_id="a" * 32)
-        storage.save_pending_restore([entry])
+        storage.save_pending_restore([entry], "game", action="suspend")
         with patch.object(suspension, "resume_records", side_effect=OSError("still recovering")), \
-                patch.object(core, "visible_apps", return_value=[]), patch.object(core, "launch_app") as launch:
+                patch.object(core, "visible_apps", side_effect=AssertionError("avoid scanning frozen apps")), \
+                patch.object(core, "launch_app") as launch:
             result = core.restore_apps()
         launch.assert_not_called()
         self.assertEqual(len(result["missing"]), 1)
-        self.assertEqual(storage.load_pending_restore()[0]["suspend_id"], "a" * 32)
+        state = storage.load_state()
+        self.assertEqual(state["action"], "suspend")
+        self.assertEqual(state["apps"][0]["suspend_id"], "a" * 32)
+        self.assertEqual(state["apps"][0]["action"], "suspend")
+        self.assertEqual(state["apps"][0]["status"], "suspended")
 
     def test_guardian_records_after_reboot_use_launch_context(self):
         import suspension
@@ -994,6 +1000,88 @@ class SafetyTests(unittest.TestCase):
             main._action_lock.release()
         self.assertEqual(len(timers), 1)
         main.notify.assert_not_called()
+
+    def test_launcher_breaks_baseline_ancestor_inheritance_but_preserves_critical_family(self):
+        # Baseline IDE -> powershell.exe -> unrelated user app should be allowed
+        nodes = [self.freeze_node(100, r"C:\Tools\Code.exe", birth=10),
+                 self.freeze_node(200, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", parent=100, birth=20),
+                 self.freeze_node(300, r"C:\Apps\editor.exe", parent=200, birth=30)]
+        root = app(exe=nodes[2]["exe"], pid=300, birth=30)
+        plan = self.freeze_plan(nodes, roots=[root], baseline=[{"exe": nodes[0]["exe"]}])
+        self.assertEqual([n["pid"] for n in plan["nodes"]], [300])
+        # Critical remote tool -> powershell.exe -> helper MUST remain protected via critical_family
+        remote_nodes = [self.freeze_node(100, r"C:\Remote\GameViewer.exe", birth=10),
+                        self.freeze_node(200, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", parent=100, birth=20),
+                        self.freeze_node(300, r"C:\Apps\editor.exe", parent=200, birth=30)]
+        remote_plan = self.freeze_plan(remote_nodes, roots=[root])
+        self.assertEqual(remote_plan["nodes"], [])
+
+    def test_critical_directories_ignores_shared_root_folders(self):
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        nodes = [self.freeze_node(1001, os.path.join(desktop, "AnyDesk.exe"), birth=10),
+                 self.freeze_node(1002, os.path.join(desktop, "MyApp.exe"), birth=20)]
+        root = app(exe=nodes[1]["exe"], pid=1002, birth=20)
+        plan = self.freeze_plan(nodes, roots=[root])
+        self.assertEqual([n["pid"] for n in plan["nodes"]], [1002])
+
+    def test_preview_empty_targets_skips_process_inventory(self):
+        import suspension
+        storage.save_baseline([self.target], full_processes=True)
+        with patch.object(core, "process_inventory", side_effect=AssertionError("must not scan on empty targets")):
+            plan = suspension.preview([])
+        self.assertEqual(plan, {"apps": [], "nodes": [], "skipped": []})
+
+    def test_clip_notify_text_enforces_win32_bounds(self):
+        clipped_msg = main._clip_notify_text("a" * 350, 240)
+        clipped_title = main._clip_notify_text("t" * 100, 60)
+        self.assertEqual(len(clipped_msg), 240)
+        self.assertTrue(clipped_msg.endswith("..."))
+        self.assertEqual(len(clipped_title), 60)
+        self.assertEqual(main._clip_notify_text("short", 240), "short")
+
+    def test_client_monitor_continues_after_healthy_probe_error(self):
+        import suspension
+        client = object.__new__(suspension.Client)
+        client.id = "b" * 32
+        client.stop_event = threading.Event()
+        client.stop_event.wait = MagicMock(return_value=False)
+        client.events = MagicMock()
+        client.events.poll.side_effect = [False, True]
+        client.child = MagicMock()
+        client.child.poll.return_value = None
+        client.healthy = MagicMock(side_effect=RuntimeError("transient probe error"))
+        recovered_ids = []
+        client.recovered = recovered_ids.append
+        client._monitor()
+        self.assertEqual(recovered_ids, [client.id])
+        client.events.set.assert_not_called()
+
+    def test_restore_apps_prunes_completed_operations_after_manual_restore(self):
+        import suspension
+        entry = dict(self.target, action="suspend", status="suspended", suspend_id="c" * 32)
+        storage.save_pending_restore([entry], "game", action="suspend")
+        with patch.object(suspension, "resume_records"), \
+                patch.object(suspension, "prune_completed_operations") as prune, \
+                patch.object(core, "visible_apps", return_value=[]):
+            result = core.restore_apps()
+        self.assertEqual(len(result["restored"]), 1)
+        prune.assert_called_once_with(set())
+
+    def test_winprocess_resume_tolerates_process_is_terminating(self):
+        import winprocess
+        with patch.object(winprocess, "signaled", return_value=False), \
+                patch.object(winprocess, "_resume", return_value=-1073741558):  # 0xC000010A signed
+            winprocess.resume(1234)
+
+    def test_depth_ignores_reused_parent_pid(self):
+        # Root (pid 1001, birth 100) has stale ppid=9000 reused by newer chain (birth 500)
+        nodes = [self.freeze_node(1001, r"C:\Apps\parent.exe", parent=9000, birth=100),
+                 self.freeze_node(1002, r"C:\Apps\child.exe", parent=1001, birth=101),
+                 self.freeze_node(9000, r"C:\Other\new1.exe", parent=9001, birth=500),
+                 self.freeze_node(9001, r"C:\Other\new2.exe", parent=9002, birth=499),
+                 self.freeze_node(9002, r"C:\Other\new3.exe", parent=0, birth=498)]
+        plan = self.freeze_plan(nodes, roots=[app(exe=nodes[0]["exe"], pid=1001, birth=100)])
+        self.assertEqual([n["pid"] for n in plan["nodes"]], [1001, 1002])
 
 
 if __name__ == "__main__":
